@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Run the repository's NERSC companion, remote/nersc, on this workstation.
+
+It runs in place, so there is no second copy to drift, and it keeps its config
+and state in cluster's own trees (clustertool.companion.local_environment).
+"""
+
+import os
+import sys
+
+# In syntax an old interpreter can read: the package needs Python 3.8.
+if sys.version_info < (3, 8):
+    sys.stderr.write("nersc: needs Python 3.8 or newer, but %s is %s\n"
+                     % (sys.executable or "python3", sys.version.split()[0]))
+    sys.exit(1)
+
+REPO_ROOT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
+SOURCE = os.path.join(REPO_ROOT, "remote", "nersc")
+
+if __name__ == "__main__":
+    sys.path.insert(0, REPO_ROOT)
+    from clustertool import companion
+
+    os.execve(sys.executable, [sys.executable, SOURCE] + sys.argv[1:],
+              companion.local_environment(os.environ))

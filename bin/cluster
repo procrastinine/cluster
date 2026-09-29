@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Entry point for the cluster tool."""
+
+import os
+import sys
+
+# Before importing anything of ours, and in syntax an old interpreter can read:
+# on 3.7 and older the failure would otherwise be a traceback from deep inside
+# the package (shlex.join and Path.unlink(missing_ok=) both arrived in 3.8).
+if sys.version_info < (3, 8):
+    sys.stderr.write("cluster: needs Python 3.8 or newer, but %s is %s\n"
+                     % (sys.executable or "python3", sys.version.split()[0]))
+    sys.exit(1)
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+# Not a command: the relay host's end of bin/cluster-relay's pipe, which is the
+# cluster-relay of this same checkout, so the laptop names only `cluster`.
+if sys.argv[1:2] == ["--relay-serve"]:
+    relay = os.path.join(HERE, "cluster-relay")
+    os.execv(sys.executable, [sys.executable, relay, "--serve"] + sys.argv[2:])
+
+sys.path.insert(0, os.path.join(HERE, ".."))
+
+from clustertool import platform as plat  # noqa: E402
+from clustertool.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    # SIGTERM and SIGHUP (a closed terminal, `kill`, a service stop) unwind the
+    # command as Ctrl-C does, so what it opened is closed on the way out.
+    plat.unwind_on_signals()
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except plat.Terminated as ended:
+        sys.exit(ended.code)

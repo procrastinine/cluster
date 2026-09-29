@@ -1,0 +1,28 @@
+# rsync exclude list for `nersc sync` (mirror_src here -> mirror_dest on NERSC).
+# Installed next to the companion's config (~/.config/nersc/mirror.exclude on
+# the hub) only when that file is missing; edit the installed copy.
+#
+# The mirror carries code, docs and small inputs — never environments and
+# never bulk data (runs live on scratch and move with `nersc push`/`pull`).
+# Excluded entries are also protected from --delete on the NERSC side, which
+# is what makes a NERSC-built .venv safe to keep inside the mirror path.
+
+# environments (rebuild them on NERSC)
+.venv*
+__pycache__
+.pytest_cache
+.mypy_cache
+*.pyc
+
+# agent state and editor droppings
+.claude
+.codex
+.vscode-server
+*.swp
+
+# stray login-node slurm logs at the repo root
+slurm-*.out
+
+# add your project's bulk or regenerable trees below, anchored with a leading /
+# /data
+# /results

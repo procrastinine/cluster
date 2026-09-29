@@ -1,0 +1,1473 @@
+#!/usr/bin/env python3
+"""``cluster`` for a machine that reaches the clusters only through a relay host.
+
+The credentials, the 2FA-paced control masters and the per-login state that
+says what ``main:`` means all live on the relay host. A copy on the laptop
+would be a second set of secrets competing for the same TOTP windows, so the
+laptop has none of it: every verb is forwarded to the relay host and run there.
+
+``transfer`` cannot be forwarded as it is, because one of its paths is here.
+Its bytes cross the relay host as a pipe, tar at each end and ssh between, and
+never rest on its disk. The ``--serve`` half of this script, on the relay host,
+holds the transfer lease while the stream runs, so another transfer finishing
+cannot close the master under it, and the sizes that arrived are read back and
+compared, name by name, with what was sent. A request tar cannot express
+(``--sync``, ``--move``, a filter) is staged through the relay host's disk
+instead, and says so.
+
+The client half reads nothing of the package's state, which this machine has
+none of: it imports only ``clustertool.backoff``, the rule for trying again
+that the tool's own reconnects follow, which reads no state. Its settings are
+the ``[relay]`` section of the tool's ``settings.ini``, read with
+configparser.
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import functools
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+from pathlib import Path
+
+PROG = "cluster"
+
+IS_MAC = sys.platform == "darwin"
+
+
+def _xdg(variable, fallback):
+    """An XDG base directory, or *fallback* when the variable is unset, empty or
+    relative (the XDG spec says a relative value is to be ignored)."""
+    value = os.environ.get(variable, "")
+    return Path(value) if os.path.isabs(value) else fallback
+
+
+#: The settings file `cluster` itself reads. This script uses its [relay]
+#: section, and CLUSTER_RELAY_<KEY> overrides a key for one run.
+SETTINGS_FILE = _xdg("XDG_CONFIG_HOME", Path.home() / ".config") / "cluster" / "settings.ini"
+
+#: The checkout this script belongs to, found through any symlink. The package
+#: is imported from here, never from anywhere else: all of it by --serve, and
+#: clustertool.backoff by the client.
+CLUSTER_ROOT = str(Path(__file__).resolve().parents[1])
+
+#: The [relay] keys that say how the client tries again, with their defaults.
+#: `cluster config` declares each as RELAY_<KEY>; tests/test_relay.py checks
+#: that the two agree.
+RETRY_DEFAULTS = {
+    "RETRIES": 3,            # lost connections in quick succession tried again
+    "RETRY_DELAY": 2,        # seconds before the first try again
+    "RETRY_DELAY_MAX": 60,   # the longest wait, which the wait doubles up to
+    "RETRY_HALF_LIFE": 300,  # seconds of a resumed copy's progress that halve it
+}
+
+#: How often a staged transfer shows the relay host it is still running (see
+#: StageKeeper), well inside STAGE_MAX_AGE_MIN.
+STAGE_KEEP_EVERY = 600
+
+#: Staged copies live here, one directory per run. On disk, not on a tmpfs.
+#: Expanded by the relay host's shell, always inside double quotes.
+STAGE_ROOT = "$HOME/.cache/cluster-relay"
+
+#: How long a staging directory may go untouched before a later run sweeps it.
+#: A run touches its own every STAGE_KEEP_EVERY seconds while it lasts, so only
+#: one whose run is gone, killed in a way that outran its own cleanup, ages.
+STAGE_MAX_AGE_MIN = 1440
+
+#: Options that swallow the token after them. Without this the value of
+#: `--exclude '*.log'` is read as a third path. Mirrored from
+#: clustertool.commands.transfers.RCLONE_VALUE_FLAGS, which tests/test_relay.py
+#: checks is all here, plus `cluster transfer`'s own options.
+VALUE_FLAGS = frozenset("""
+    --backup-dir --bwlimit --checkers --compare-dest --config --contimeout
+    --copy-dest --exclude --exclude-from --files-from --filter --filter-from
+    --include --include-from --log-file --log-level --low-level-retries
+    --max-age --max-backlog --max-depth --max-size --max-transfer --min-age
+    --min-size --modify-window --multi-thread-streams --order-by --retries
+    --sftp-connections --stats --suffix --timeout --transfers
+    --via --node --engine --executor --peer-node
+""".split())
+
+#: Requests tar cannot express, so they go through the relay host's disk.
+NEEDS_RCLONE = frozenset("""
+    --sync --move --exclude --exclude-from --filter --filter-from --files-from
+    --include --include-from --ignore-existing --max-age --max-size
+    --max-transfer --min-age --min-size --backup-dir --bwlimit --compare-dest
+    --copy-dest --suffix
+""".split())
+
+#: A path that names a cluster: a backend name, or a login name, before the
+#: colon. `local:` and `relay:` are handled separately.
+QUALIFIED = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*:")
+
+GLOB_CHARS = "*?["
+
+
+def usage():
+    """The client's own help, for before a relay host is set up."""
+    return f"""\
+usage: {PROG} COMMAND [ARGS...]
+
+This is bin/cluster-relay. It runs every {PROG} command over ssh on a relay
+host, the machine where {PROG} is set up, and `transfer` moves files between
+this machine and a cluster through that host.
+
+Settings, in the [relay] section of {SETTINGS_FILE}
+(CLUSTER_RELAY_<KEY> overrides one for a single run):
+  HOST  user@host of the relay host (required)
+  BIN   the {PROG} command there (default: ~/.local/bin/cluster if it exists,
+        else {PROG} on its PATH); transfers run `BIN --relay-serve`, which is
+        the bin/cluster-relay of that checkout
+  RETRIES          lost connections in quick succession a transfer tries
+                   again after (3)
+  RETRY_DELAY      seconds before trying again (2); doubles with each loss
+  RETRY_DELAY_MAX  the longest wait before trying again (60)
+  RETRY_HALF_LIFE  seconds of a staging copy's progress that halve the count
+                   of losses (300)
+
+Transfer paths: LOGIN:path, BACKEND:path and remote:path are on a cluster,
+relay:path is on the relay host, and local:path or a plain path is here.
+
+Once HOST is set, `{PROG} --help` lists every command.
+"""
+
+
+def die(message, *hints):
+    print(f"{PROG}: {message}", file=sys.stderr)
+    for hint in hints:
+        print(f"  {hint}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def note(message):
+    print(f"{PROG}: {message}", file=sys.stderr)
+
+
+# --- settings ---------------------------------------------------------------
+@functools.lru_cache(maxsize=None)
+def _relay_section():
+    """The [relay] section of the settings file as {KEY: value}, or None."""
+    # Not strict: a second [relay] section, as appending the suggested lines to
+    # a file that has one makes, is read with the later value winning.
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as handle:
+            parser.read_file(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, configparser.Error) as exc:
+        note(f"warning: cannot read {SETTINGS_FILE}: {exc}")
+        return None
+    if not parser.has_section("relay"):
+        return None
+    return {key.upper(): value.strip() for key, value in parser.items("relay")}
+
+
+def relay_setting(key):
+    """One [relay] key: CLUSTER_RELAY_<KEY>, else the settings file, else ""."""
+    override = os.environ.get(f"CLUSTER_RELAY_{key}", "").strip()
+    if override:
+        return override
+    return (_relay_section() or {}).get(key, "")
+
+
+def relay_number(key):
+    """A number from [relay], or its default in RETRY_DEFAULTS."""
+    raw = relay_setting(key)
+    default = RETRY_DEFAULTS[key]
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not 0 <= value < float("inf"):
+        die(f"[relay] {key} is {raw!r}, which is not a number of 0 or more",
+            f"its default is {default}; CLUSTER_RELAY_{key} overrides it for "
+            f"one run, and {SETTINGS_FILE} sets it")
+    return value
+
+
+def retry_memory():
+    """What the client remembers of recent failures, to judge when to try
+    again and when to stop: clustertool.backoff's rule, the one the tool's own
+    reconnects follow, with the [relay] RETRY* settings."""
+    if CLUSTER_ROOT not in sys.path:
+        sys.path.insert(0, CLUSTER_ROOT)
+    from clustertool.backoff import FailureMemory
+
+    return FailureMemory(relay_number("RETRY_HALF_LIFE"),
+                         limit=int(relay_number("RETRIES")),
+                         delay=relay_number("RETRY_DELAY"),
+                         delay_max=relay_number("RETRY_DELAY_MAX"))
+
+
+def riding(attempt, lost, resumes, retrying):
+    """Run *attempt*() again after each lost connection, as retry_memory() says.
+
+    *attempt*() returns (status, far): its exit status, and the status that
+    says what became of its connection. Only a *far* in *lost* is tried again.
+    Anything else is the answer, a refusal included, and the caller says what
+    it means. The time a try ran counts in its favour only when it *resumes*,
+    that is when the next try takes up where it stopped: one that starts
+    again from its first byte has nothing to show for it, however long it ran.
+    *retrying*(status, wait) says why it is tried again.
+
+    Returns (status, far, memory); memory.exhausted says it gave up on a
+    connection that would not stay up.
+    """
+    memory = retry_memory()
+    while True:
+        started = time.monotonic()
+        status, far = attempt()
+        if status == 0 or far not in lost:
+            return status, far, memory
+        memory.failed(time.monotonic() - started if resumes else 0.0)
+        if memory.exhausted:
+            return status, far, memory
+        wait = memory.wait()
+        note(retrying(status, wait))
+        time.sleep(wait)
+
+
+def stopped_by_the_relay_host(host, far, what):
+    """Die for the two answers --serve gives that are not the cluster's: a
+    refused credential, and no cluster to run. *what* says what did not
+    happen."""
+    if far == NO_TOOL:
+        die("the relay host has no cluster to run",
+            "the reason is above; [relay] BIN says where it is")
+    if far == REFUSED:
+        die(f"the cluster refused the credentials, so {what}",
+            "the reason is above; asking again would only be refused again",
+            f"`{PROG} login`, run from here, connects by hand on {host}, "
+            "which tries them again")
+
+
+def relay_host():
+    host = relay_setting("HOST")
+    if not host:
+        die("no relay host is set up: [relay] HOST names the machine that runs "
+            f"{PROG}",
+            f"mkdir -p {shlex.quote(str(SETTINGS_FILE.parent))} && "
+            "printf '\\n[relay]\\nHOST = %s\\n' user@relay.example.org >> "
+            f"{shlex.quote(str(SETTINGS_FILE))}",
+            "CLUSTER_RELAY_HOST overrides it for one run",
+            f"`{PROG} --help` says more")
+    return host
+
+
+# --- talking to the relay ---------------------------------------------------
+#: For every ssh to the relay host, rsync's included. Without a ConnectTimeout
+#: an unreachable host takes as long as TCP gives up; the keepalives end a
+#: stream whose link died instead of leaving it blocked. The values are the
+#: tool's own CONNECT_TIMEOUT and EXTERNAL_SSH_SERVER_ALIVE_* defaults.
+SSH_OPTIONS = ("-o", "ConnectTimeout=25",
+               "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4")
+
+
+def ssh_argv(host, command, tty=False, batch=False):
+    """ssh to the relay host. A *batch* one never asks for a password or a
+    passphrase, for an ssh nobody is there to answer."""
+    argv = ["ssh", *SSH_OPTIONS]
+    if batch:
+        argv += ["-o", "BatchMode=yes"]
+    if tty:
+        argv.append("-t")
+    argv += [host, command]
+    return argv
+
+
+def remote(host, command, capture=False, tty=False):
+    """Run one command line on the relay host."""
+    argv = ssh_argv(host, command, tty=tty)
+    if capture:
+        return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True)
+    return subprocess.run(argv)
+
+
+def remote_value(host, command):
+    got = remote(host, command, capture=True)
+    if got.returncode != 0:
+        return ""
+    return (got.stdout or "").strip()
+
+
+def quoted(args):
+    return " ".join(shlex.quote(a) for a in args)
+
+
+def sh_line(script, *args):
+    """A command line that runs *script* under sh with *args* as $1, $2, ...
+
+    The relay host's login shell only reads quoted words, which every
+    POSIX shell reads alike, and no argument is pasted into the script.
+    """
+    return quoted(["sh", "-c", script, "sh", *args])
+
+
+#: How LAUNCH says the relay host has no cluster to run: its own code, so it
+#: is not mistaken for a command's 127 coming back through `cluster run`.
+NO_TOOL = 97
+
+#: How --serve says the cluster refused the credentials: its own code, so the
+#: client stops rather than asking again, which would only be refused again,
+#: and on FASRC counts toward locking the account.
+REFUSED = 96
+
+#: How --serve says its connection to the cluster was lost, or could not be
+#: opened for a reason that may pass: ssh's own status, which the ssh to the
+#: relay host gives for a connection it lost, so the client reads both alike.
+#: A lost connection is the one failure the client tries again.
+LOST = 255
+
+#: POSIX sh, run on the relay host as `LAUNCH BIN ARGS...`: BIN, or else
+#: ~/.local/bin/cluster if it exists, else cluster on the PATH. A leading ~/
+#: is the relay user's home.
+LAUNCH = " ".join((
+    'bin=$1; shift;',
+    'case $bin in',
+    '"~/"*) bin=$HOME/${bin#"~/"} ;;',
+    '"") bin=$HOME/.local/bin/cluster; [ -x "$bin" ] || bin=cluster ;;',
+    'esac;',
+    'case $bin in */*) [ -x "$bin" ] ;; *) command -v "$bin" >/dev/null ;; esac ||',
+    '{ echo "cluster: the relay host has no $bin; set [relay] BIN" >&2;',
+    f'exit {NO_TOOL}; }};',
+    'exec "$bin" "$@"',
+))
+
+
+def relay_line(args):
+    """The relay host's command line for `cluster ARGS`."""
+    return sh_line(LAUNCH, relay_setting("BIN"), *args)
+
+
+# --- staging ----------------------------------------------------------------
+def make_stage(host):
+    """A fresh staging directory on the relay host, and a sweep of old ones."""
+    sweep = (f'root="{STAGE_ROOT}"; mkdir -p "$root" && '
+             f'{{ find "$root" -mindepth 1 -maxdepth 1 -type d '
+             f'-mmin +{STAGE_MAX_AGE_MIN} -exec rm -rf {{}} + 2>/dev/null; '
+             f'mktemp -d "$root/xfer-XXXXXXXX"; }}')
+    stage = remote_value(host, sh_line(sweep))
+    if not stage or "/" not in stage:
+        die("could not make a staging directory on the relay host",
+            f"tried under {STAGE_ROOT}")
+    if shlex.quote(stage) != stage:
+        # rsync hands a remote path to the far side differently before and
+        # after 3.2.4; only a path no shell would change goes the same way.
+        die(f"the staging directory {stage} on the relay host has characters "
+            "rsync cannot pass safely", "staged transfers need a plainer $HOME")
+    return stage
+
+
+def drop_stage(host, stage):
+    """Remove a staging directory. Never raises: it runs from a finally."""
+    if not stage:
+        return
+    try:
+        remote(host, sh_line('rm -rf -- "$1"', stage), capture=True)
+    except Exception:                                    # noqa: BLE001
+        note(f"warning: could not remove the staging directory {stage}")
+
+
+#: Run by python3 on the relay host while a staged transfer lasts: it touches
+#: the staging directory every *every* seconds, so that the age make_stage's
+#: sweep goes by is the time since the run was last seen, and ends when its
+#: stdin does, which is when the client exits, however it exits.
+STAGE_KEEPER = """\
+import os, select, sys
+stage, every = sys.argv[1], float(sys.argv[2])
+while True:
+    try:
+        os.utime(stage)
+    except OSError:
+        pass
+    if select.select([0], [], [], every)[0] and not os.read(0, 512):
+        break
+"""
+
+
+class StageKeeper:
+    """Keeps a staging directory on the relay host looking used while it is.
+
+    One ssh runs STAGE_KEEPER there. When that connection drops, a watch here
+    starts another, every *every* seconds until one holds, so a transfer that
+    rides out a drop is not then swept as abandoned. A keeper that cannot
+    reach the relay host costs nothing: the transfer itself can't either. Its
+    ssh never prompts: it starts in the background, where a prompt would take
+    the terminal from the transfer.
+    """
+
+    def __init__(self, host, stage, every=STAGE_KEEP_EVERY):
+        import threading
+
+        self.host, self.stage, self.every = host, stage, every
+        self.proc = None
+        self.stopped = threading.Event()
+        self._start()
+        self.watch = threading.Thread(target=self._watch, daemon=True)
+        self.watch.start()
+
+    def _start(self):
+        script = quoted(["python3", "-c", STAGE_KEEPER, self.stage, str(self.every)])
+        try:
+            self.proc = subprocess.Popen(ssh_argv(self.host, script, batch=True),
+                                         stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+        except OSError:
+            self.proc = None
+
+    def _watch(self):
+        while not self.stopped.wait(self.every):
+            if self.proc is None or self.proc.poll() is not None:
+                if self.proc is not None:
+                    # Its far end, if anything of it is left, ends with this.
+                    _shut(self.proc.stdin)
+                self._start()
+
+    def stop(self):
+        """End the keeper here and there. Never raises: it runs from a finally."""
+        self.stopped.set()
+        self.watch.join()
+        proc = self.proc
+        if proc is None:
+            return
+        _shut(proc.stdin)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        except Exception:                                # noqa: BLE001
+            pass
+
+
+def free_bytes(host, path):
+    """Free bytes at *path* on the relay host, a path its shell expands."""
+    line = remote_value(host, sh_line(f'df -Pk "{path}" | tail -n 1'))
+    parts = line.split()
+    if len(parts) < 4 or not parts[3].isdigit():
+        return None
+    return int(parts[3]) * 1024
+
+
+#: Run by python3 on the relay host, which `cluster` there needs anyway, so a
+#: macOS relay host answers too (it has no `find -printf`): the names in a
+#: staging directory, which of them are directories, and the bytes in the
+#: regular files under it.
+STAGE_REPORT = """\
+import json, os, stat, sys
+root = sys.argv[1]
+total = 0
+for top, _dirs, files in os.walk(root):
+    for name in files:
+        try:
+            info = os.lstat(os.path.join(top, name))
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            total += info.st_size
+items = sorted(os.listdir(root))
+dirs = [n for n in items if stat.S_ISDIR(os.lstat(os.path.join(root, n)).st_mode)]
+print(json.dumps({"items": items, "dirs": dirs, "bytes": total}))
+"""
+
+
+def stage_report(host, stage):
+    """(names in *stage*, those that are directories, bytes in its files)."""
+    text = remote_value(host, quoted(["python3", "-c", STAGE_REPORT, stage]))
+    try:
+        report = json.loads(text)
+        return list(report["items"]), set(report["dirs"]), int(report["bytes"])
+    except (ValueError, KeyError, TypeError):
+        die("could not read what was staged on the relay host",
+            f"that runs python3 there; `ssh {host} python3 -V` shows whether "
+            "it can")
+
+
+def local_bytes(path):
+    target = Path(path).expanduser()
+    if target.is_file() or target.is_symlink():
+        try:
+            return target.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    for root, _dirs, files in os.walk(target):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def human(size):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+# --- rsync ------------------------------------------------------------------
+@functools.lru_cache(maxsize=None)
+def rsync_progress(program):
+    """--info=progress2 where rsync's help lists --info (3.1 and newer), else
+    --progress where it lists that (2.6.9, openrsync), else -v."""
+    try:
+        text = subprocess.run([program, "--help"], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True,
+                              errors="replace", timeout=10).stdout or ""
+    except (OSError, subprocess.TimeoutExpired):
+        text = ""
+    return ("--info=progress2" if "--info" in text
+            else "--progress" if "--progress" in text else "-v")
+
+
+def rsync(sources, dest, show_progress, names=()):
+    listing = "".join(f"{name}\0" for name in names).encode() if names else None
+    return subprocess.run(rsync_argv(sources, dest, show_progress, names),
+                          input=listing).returncode
+
+
+#: rsync's statuses for a copy its connection cut short, which running it again
+#: resumes: 10 socket I/O, 12 protocol stream, 30 and 35 timeouts, 255 ssh.
+#: The relay host is reached with no master to look at, so the status is the
+#: evidence there is.
+RSYNC_RESUMABLE = (10, 12, 30, 35, 255)
+
+
+def rsync_riding(what, sources, dest, show_progress, names=()):
+    """rsync(), run again when its connection is cut (riding()).
+
+    --partial keeps what arrived, so each run takes up where the last one
+    stopped, and the time a cut-short run spent counts in its favour: drops
+    spread over a long copy never add up, while a connection that will not
+    stay up ends it. Any other failure stands. *what* names the hop.
+    """
+    def run():
+        rc = rsync(sources, dest, show_progress, names)
+        return rc, rc
+
+    rc, _far, memory = riding(run, RSYNC_RESUMABLE, True, lambda rc, wait: (
+        f"{what}: rsync lost its connection (exit {rc}); resuming in "
+        f"{wait:.0f}s, and what arrived is not sent again"))
+    if memory.exhausted:
+        note(f"{what}: rsync lost its connection {memory.fresh} times in "
+             f"quick succession; [relay] RETRIES ({memory.limit}) is how "
+             "many are resumed")
+    return rc
+
+
+def rsync_argv(sources, dest, show_progress, names=()):
+    """rsync -a between here and the relay host; a remote end is (host, path).
+
+    Every remote path is one no shell would change (make_stage and stage_down
+    see to it), so it goes bare: rsync before and after 3.2.4 pass it on alike,
+    and neither end needs -s. *names*, the items of one source directory to
+    copy, go in rsync's file list on stdin, never through a shell. Local ends
+    are absolute, so none reads as an option or, through a colon, as a host.
+    """
+    program = shutil.which("rsync") or die(
+        "rsync is not installed",
+        "the relay stages files with rsync; install it (brew install rsync)")
+    argv = [program, "-a", "--partial"]
+    if not os.environ.get("RSYNC_RSH"):
+        argv += ["-e", " ".join(("ssh",) + SSH_OPTIONS)]
+    if show_progress:
+        argv.append(rsync_progress(program))
+    if names:
+        argv += ["-r", "--from0", "--files-from=-"]
+    return argv + [f"{end[0]}:{end[1]}" if isinstance(end, tuple) else end
+                   for end in (*sources, dest)]
+
+
+# --- tar on this machine ----------------------------------------------------
+def tar_env():
+    """The environment for this machine's end of a stream.
+
+    macOS's tar (bsdtar) writes extended attributes such as
+    com.apple.quarantine as AppleDouble `._name` entries, which tar on the
+    cluster unpacks as real files. COPYFILE_DISABLE=1 stops that; GNU tar
+    ignores it.
+    """
+    return dict(os.environ, COPYFILE_DISABLE="1")
+
+
+def _tar_accepts(flags):
+    try:
+        probe = subprocess.run(["tar", *flags, "-cf", os.devnull, os.devnull],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, env=tar_env())
+    except OSError:
+        return False
+    return probe.returncode == 0
+
+
+@functools.lru_cache(maxsize=None)
+def mac_tar_flags():
+    """Metadata-off flags for bsdtar on macOS, where this tar takes them.
+
+    --no-mac-metadata also keeps an unpacking tar from folding a `._name` file
+    from the cluster into attributes; --no-xattrs keeps attributes out of the
+    headers, which tar on the cluster would warn about.
+    """
+    if not IS_MAC:
+        return ()
+    for flags in (("--no-mac-metadata", "--no-xattrs"), ("--no-mac-metadata",)):
+        if _tar_accepts(flags):
+            return flags
+    return ()
+
+
+def tar_argv(mode, *rest):
+    """This machine's tar, *mode* "-cf" or "-xf", on stdout or stdin."""
+    return ["tar", *mac_tar_flags(), mode, "-", *rest]
+
+
+def member(name):
+    """A name for tar inside its -C directory, never read as an option."""
+    return "./" + name if name.startswith("-") else name
+
+
+def local_path(path):
+    """An absolute path for *path* on this machine, `~` expanded."""
+    return Path(os.path.abspath(os.path.expanduser(path)))
+
+
+def folds_case(directory):
+    """Whether *directory* stores `a` and `A` as one name, asked with a probe
+    file: macOS folds case by default, but not on every volume."""
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".cluster-relay-Case-", dir=directory)
+    except OSError:
+        return False        # unwritable: the fetch itself will say so
+    os.close(fd)
+    try:
+        return os.path.exists(os.path.join(directory,
+                                           os.path.basename(probe).swapcase()))
+    finally:
+        os.unlink(probe)
+
+
+def _listdir(path):
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
+def case_clashes(into, names):
+    """Spellings among *names* (relative to *into*) and what *into* holds that a
+    case-folding file system would store as one name, at any directory level.
+
+    Asked before anything is written; afterwards the manifest could only say
+    which file was lost. Only the directories the names enter are listed.
+    """
+    base = into
+    while not base.is_dir():
+        if base.parent == base:
+            return []
+        base = base.parent
+    if not folds_case(base):
+        return []
+    arriving = {"/".join(parts[:depth]) for parts in (n.split("/") for n in names)
+                for depth in range(1, len(parts) + 1)}
+    there = {f"{parent}/{entry}" if parent else entry
+             for parent in {a.rpartition("/")[0] for a in arriving}
+             for entry in _listdir(into / parent)}
+    spellings = {}
+    for spelling in arriving | there:
+        key = unicodedata.normalize("NFC", spelling).casefold()
+        spellings.setdefault(key, set()).add(spelling)
+    return sorted(s for group in spellings.values() if len(group) > 1
+                  for s in group)
+
+
+# --- argument shapes --------------------------------------------------------
+def positional_indices(args):
+    """Where the paths are in *args*, with flag values left attached."""
+    found, index = [], 0
+    while index < len(args):
+        token = args[index]
+        if token.startswith("-"):
+            if token in VALUE_FLAGS and index + 1 < len(args):
+                index += 2
+                continue
+        else:
+            found.append(index)
+        index += 1
+    return found
+
+
+def classify(token):
+    """(side, path) — where this path lives, and what it is without its prefix."""
+    if token.startswith("relay:"):
+        return "relay", token[len("relay:"):]
+    if token.startswith("local:"):
+        return "here", token[len("local:"):]
+    if token.startswith("remote:") or QUALIFIED.match(token):
+        return "cluster", token
+    return "here", token
+
+
+def split_cluster(token):
+    """(login, path) for a path that names a cluster.
+
+    An empty login means "whichever cluster the tool would pick", which is what
+    the relay host is told, so `remote:` and a bare default keep meaning the
+    same thing here as they do there.
+    """
+    if token.startswith("remote:"):
+        return "", token[len("remote:"):]
+    login, _sep, path = token.partition(":")
+    return login, path
+
+
+def wants(args, *names):
+    return any(a == n or a.startswith(n + "=") for a in args for n in names)
+
+
+# --- streaming through the relay host ---------------------------------------
+#: Big enough that the pump is never the bottleneck on a fast link.
+CHUNK = 4 * 1024 * 1024
+
+
+def serve_argv(host, args):
+    return ssh_argv(host, relay_line(["--relay-serve", *args]))
+
+
+def serve_value(host, args):
+    """Run a --serve mode that answers on stdout, and return what it said.
+
+    These are the probes and manifests. One whose connection was lost is
+    asked again (riding()); any other failure is the answer, and stands.
+    """
+    answer = {}
+
+    def ask():
+        got = subprocess.run(serve_argv(host, args), stdout=subprocess.PIPE,
+                             text=True)
+        answer["text"] = got.stdout or ""
+        return got.returncode, got.returncode
+
+    rc, _far, memory = riding(ask, (LOST,), False, lambda rc, wait: (
+        f"the cluster did not answer '{args[0]}': its connection was lost "
+        f"(exit {rc}); asking again in {wait:.0f}s"))
+    if rc == 0:
+        return answer["text"].strip()
+    stopped_by_the_relay_host(host, rc, f"'{args[0]}' was not answered")
+    if memory.exhausted:
+        die(f"the cluster could not answer '{args[0]}': its connection was lost "
+            f"{memory.fresh} times in quick succession (exit {rc})",
+            "any error above says why",
+            f"[relay] RETRIES ({memory.limit}) is how many lost connections in "
+            "quick succession are asked again",
+            "try: cluster status")
+    die(f"the cluster could not answer '{args[0]}' (exit {rc})",
+        "any error above is from the cluster itself; the connection held, so "
+        "asking again would get the same answer")
+
+
+def tail(path, keep=2):
+    """The end of a path, for a progress line that has to fit in a terminal."""
+    parts = str(path).rstrip("/").split("/")
+    return "/".join(parts[-keep:]) if len(parts) > keep else str(path)
+
+
+def pump(source, sink, label, total, progress, tally=None):
+    """Copy between two pipes, with a running count on stderr if *progress*:
+    on a large dataset the only sign that anything is happening. *tally*, a
+    dict, is kept up to date with the bytes moved ("moved") and the seconds
+    from the start to the last of them ("moving"), and says whether the copy
+    ended because *sink* went away ("sink gone")."""
+    moved = 0
+    last = 0.0
+    began = time.monotonic()
+    tally = {} if tally is None else tally
+    while True:
+        block = source.read(CHUNK)
+        if not block:
+            break
+        try:
+            sink.write(block)
+        except (BrokenPipeError, ValueError):
+            # The end being written to went away.  Stop copying and let the
+            # exit status of the process that died be the thing that reports
+            # the failure -- a traceback here would only hide it.
+            tally["sink gone"] = True
+            break
+        moved += len(block)
+        now = time.monotonic()
+        tally["moved"], tally["moving"] = moved, now - began
+        if progress and now - last > 0.5:
+            share = f" of {human(total)}" if total else ""
+            print(f"\r{PROG}: {label} {human(moved)}{share}   ",
+                  end="", file=sys.stderr, flush=True)
+            last = now
+    if progress:
+        print(f"\r{PROG}: {label} {human(moved)}          ", file=sys.stderr)
+    return moved
+
+
+def _spawn(argv, partner=None, **kw):
+    """Popen, or die saying why, first taking down the *partner* end already
+    running, so it is not left on a pipe that nobody holds."""
+    try:
+        return subprocess.Popen(argv, **kw)
+    except BaseException as exc:
+        if partner is not None:
+            partner.kill()
+            partner.wait()
+        if isinstance(exc, OSError):
+            die(f"could not run {argv[0]}: {exc.strerror or exc}")
+        raise
+
+
+def stream(host, serve_args, feed=None, drain=None, label="", total=0,
+           progress=False, tally=None):
+    """Run a --serve mode with one end of the pipe on this machine.
+
+    *feed* is a local argv whose stdout is sent to the cluster; *drain* is a
+    local argv fed from the cluster. Exactly one of them is given. *tally*, a
+    dict, is given what pump() records, the far end's exit status ("far"),
+    and whether the near end stopped taking data first ("near stopped"): a
+    drain that ended, as at a full disk, before what fed it did. The far end
+    then fails for want of a reader, which is no lost connection.
+    """
+    tally = {} if tally is None else tally
+    argv = serve_argv(host, serve_args)
+    here = tar_env()
+    if feed is not None:
+        near = _spawn(feed, stdout=subprocess.PIPE, env=here)
+        far = _spawn(argv, near, stdin=subprocess.PIPE)
+        source, sink = near.stdout, far.stdin
+    else:
+        far = _spawn(argv, stdout=subprocess.PIPE)
+        near = _spawn(drain, far, stdin=subprocess.PIPE, env=here)
+        source, sink = far.stdout, near.stdin
+    try:
+        pump(source, sink, label, total, progress, tally)
+    except BaseException:
+        # Ctrl-C, or anything else: do not leave half of the pipe running on
+        # the cluster with nobody reading it.
+        for proc in (near, far):
+            proc.kill()
+        raise
+    finally:
+        _shut(source)
+        _shut(sink)
+        near.wait()
+        far.wait()
+        tally["far"] = far.returncode
+        tally["near stopped"] = drain is not None and tally.get("sink gone", False)
+    return _status(near, far)
+
+
+def _shut(pipe):
+    """Close one end of a pipe without caring that the other end is gone."""
+    try:
+        pipe.close()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+
+
+def _status(*procs):
+    """The first real failure among *procs*, as a shell exit code."""
+    for proc in procs:
+        code = proc.returncode
+        if code:
+            return code if code > 0 else 128 - code
+    return 0
+
+
+def streamed(what, host, *args, **kw):
+    """stream(), run again when its connection is lost (riding()), because
+    half a transfer is not a state.
+
+    Nothing a stream does is cumulative -- recv untars over the destination,
+    write truncates it, and the two download modes overwrite locally -- so
+    running it again is the same operation, not a second one. It is also all
+    of it again, from the first byte, so the time a try ran does not count in
+    its favour, and a connection that keeps dropping ends it. Any other
+    failure stands, as does a refused credential: sending it all again would
+    end the same way.
+    """
+    tally = {}
+
+    def send():
+        tally.clear()
+        rc = stream(host, *args, tally=tally, **kw)
+        far = tally.get("far")
+        return rc, None if tally.get("near stopped") else far
+
+    rc, far, memory = riding(send, (LOST,), False, lambda rc, wait: (
+        f"the stream {what} lost its connection with "
+        f"{human(tally.get('moved', 0))} moved; starting it again from the "
+        f"first byte in {wait:.0f}s"))
+    if rc == 0:
+        return rc
+    stopped_by_the_relay_host(host, far, f"the stream {what} was not sent")
+    if memory.exhausted:
+        die(f"the stream {what} lost its connection {memory.fresh} times in "
+            "quick succession",
+            "nothing was staged anywhere, so nothing is half-written on the "
+            "relay host",
+            "the cluster connection was left open, so a retry costs no login",
+            f"[relay] RETRIES ({memory.limit}) is how many are tried again; a "
+            "stream starts again from its first byte, so the time it ran does "
+            "not count in its favour")
+    die(f"the stream {what} failed (exit {rc})",
+        "the reason is above; the connection held, so sending it all again "
+        "would end the same way")
+
+
+def manifest_of(text):
+    """{relative path: size} from a `<size> <path>` listing."""
+    found = {}
+    for line in text.split("\0"):
+        size, _sep, name = line.strip("\n").partition(" ")
+        if size.isdigit() and name:
+            if name.startswith("./"):
+                name = name[2:]
+            found[name or "."] = int(size)
+    return found
+
+
+def local_manifest(root, prefix=""):
+    """The same shape, for a path on this machine."""
+    target = Path(root).expanduser()
+    if target.is_file():
+        return {(prefix or target.name): target.stat().st_size}
+    found = {}
+    for child in target.rglob("*"):
+        if child.is_file() and not child.is_symlink():
+            rel = child.relative_to(target).as_posix()
+            found[f"{prefix}/{rel}" if prefix else rel] = child.stat().st_size
+    return found
+
+
+def prefixed(manifest, prefix):
+    """The same manifest, as seen from one level up."""
+    if not prefix:
+        return dict(manifest)
+    return {(prefix if name == "." else f"{prefix}/{name}"): size
+            for name, size in manifest.items()}
+
+
+def compare(sent, arrived, where):
+    """Fail unless everything sent is at the far side, whole."""
+    missing = [name for name in sent if name not in arrived]
+    short = [name for name in sent
+             if name in arrived and arrived[name] < sent[name]]
+    if missing or short:
+        detail = ", ".join((missing + short)[:4])
+        die(f"{len(missing) + len(short)} of {len(sent)} files did not arrive "
+            f"{where}",
+            f"missing or short: {detail}",
+            "nothing was staged anywhere, so nothing is half-written")
+    return True
+
+
+# --- the transfer verb ------------------------------------------------------
+def relay_transfer(host, args):
+    """Move this machine's side through the relay host, as a pipe."""
+    spots = positional_indices(args)
+    if len(spots) < 2:
+        # Anything else is the real tool's argument error to report, and it says
+        # it far better than a guess from here would.
+        return forward(host, ["transfer"] + args)
+
+    sides = [classify(args[i]) for i in spots]
+    rewritten = list(args)
+    for (kind, path), i in zip(sides, spots):
+        if kind == "relay":
+            rewritten[i] = path
+
+    dest_kind = sides[-1][0]
+    kinds = [kind for kind, _p in sides[:-1]]
+
+    if "here" not in kinds and dest_kind != "here":
+        # Every path already lives where the real tool can see it: the relay
+        # host's own disk, or the cluster. It needs no help from this script.
+        return forward(host, ["transfer"] + rewritten)
+    if "here" in kinds and any(k != "here" for k in kinds):
+        die("some of these sources are on this machine and some are not",
+            "a single transfer moves one side; run them separately")
+    if dest_kind == "here" and "here" in kinds:
+        die("neither side of this transfer names a cluster",
+            "read as paths on this machine: "
+            + " ".join(args[i] for i in spots),
+            "from here a cluster path needs its login: LOGIN:/path/...")
+    if "relay" in kinds or dest_kind == "relay":
+        die("this copies between the relay host and this machine, which is not "
+            "a cluster transfer",
+            f"scp does that directly: scp {host}:<path> <here>")
+
+    # One stream rides one connection, and a connection belongs to one login.
+    # That is a reason to group the sources, not to refuse them: each cluster
+    # gets its own run, in the order they were typed, and the user sees one
+    # command and one result.
+    logins, order = {}, []
+    for kind, path in sides[:-1]:
+        name = split_cluster(path)[0] if kind == "cluster" else None
+        if name not in logins:
+            order.append(name)
+            logins[name] = []
+        logins[name].append(path)
+    dest_login = (split_cluster(sides[-1][1])[0]
+                  if dest_kind == "cluster" else None)
+
+    quiet = wants(args, "-q", "--quiet")
+    progress = not quiet and sys.stderr.isatty()
+
+    # tar carries files, not intentions. A request that says something about
+    # *which* files or what to do with the originals cannot be expressed as a
+    # pipe, so those go the long way round — through the relay host's disk,
+    # which is the one path where its free space is a limit.
+    cannot_stream = [flag for flag in args
+                     if flag.split("=", 1)[0] in NEEDS_RCLONE]
+
+    if wants(args, "-n", "--dry-run"):
+        # Before anything is staged: a dry run moves nothing, on either hop.
+        what = (" ".join(args[i] for i in spots[:-1])
+                + f" -> {args[spots[-1]]}")
+        if cannot_stream:
+            note(f"would stage {what} through {host}'s disk "
+                 f"({' '.join(cannot_stream)} cannot be streamed)")
+        else:
+            note(f"would stream {what}, through {host}")
+        return 0
+
+    if cannot_stream:
+        note(f"{' '.join(cannot_stream)} cannot be streamed; staging through "
+             f"the relay host's disk instead (its free space is the limit)")
+        stage = keeper = None
+        try:
+            stage = make_stage(host)
+            keeper = StageKeeper(host, stage)
+            if dest_kind == "cluster":
+                return stage_up(host, stage, [p for _k, p in sides[:-1]],
+                                rewritten, spots[:-1], progress)
+            return stage_down(host, stage, sides[-1][1], rewritten, spots[-1],
+                              [p for _k, p in sides[:-1]], args, progress)
+        finally:
+            if keeper is not None:
+                keeper.stop()
+            drop_stage(host, stage)
+
+    contents = wants(args, "--contents")
+    if dest_kind == "cluster":
+        # Uploading: every source is on this machine, so there is one group.
+        return stream_up(host, dest_login, [p for _k, p in sides[:-1]],
+                         split_cluster(sides[-1][1])[1], contents, progress)
+    for index, name in enumerate(order):
+        rc = stream_down(host, name, [split_cluster(p)[1] for p in logins[name]],
+                         sides[-1][1], contents, progress)
+        if rc != 0:
+            if len(order) > 1:
+                note(f"stopped after {index} of {len(order)} clusters")
+            return rc
+    return 0
+
+
+def stream_up(host, login, sources, dest, contents, progress):
+    """Laptop -> relay host -> cluster, as one pipe."""
+    targets = []
+    for path in sources:
+        target = local_path(path)
+        if not target.exists():
+            die(f"{path} does not exist here",
+                "from this machine a cluster path needs its login, as in "
+                "LOGIN:/path/...")
+        targets.append(target)
+    # A trailing slash means "the contents of", per source, exactly as it does
+    # for the tool this is a front end to.
+    inner = [(contents or path.rstrip().endswith("/")) and target.is_dir()
+             for path, target in zip(sources, targets)]
+
+    kind = serve_value(host, ["probe", "--login", login, "--path", dest,
+                              "--keep"])
+    dest_is_dir = kind == "dir" or dest.endswith("/") or len(targets) > 1
+    if kind.startswith("file") and len(targets) > 1:
+        die(f"{len(targets)} sources need a directory to copy into",
+            f"{dest} is already a file")
+
+    sent = {}
+    if not dest_is_dir and not inner[0] and targets[0].is_file():
+        # DEST names the file itself: no tar, just the bytes.
+        sent = {".": targets[0].stat().st_size}
+        streamed(f"to {dest}", host,
+                 ["write", "--login", login, "--into", dest, "--keep"],
+                 feed=["cat", str(targets[0])], label=f"sending {tail(dest)}",
+                 total=sent["."], progress=progress)
+        arrived = serve_value(host, ["probe", "--login", login, "--path", dest])
+        size = int(arrived.split()[1]) if arrived.startswith("file") else -1
+        if size < sent["."]:
+            die(f"{dest} is {size} bytes on the cluster, expected {sent['.']}",
+                "the stream was cut short")
+        return 0
+
+    # One tar for all of the sources: they share a destination, so they can
+    # share the pipe, and the cluster is asked for its connection once.
+    feed = tar_argv("-cf")
+    for target, take_inside in zip(targets, inner):
+        if take_inside:
+            feed += ["-C", str(target), "."]
+            sent.update(local_manifest(target))
+        else:
+            feed += ["-C", str(target.parent), member(target.name)]
+            sent.update(local_manifest(target, prefix=target.name))
+    total = sum(sent.values())
+    streamed(f"to {dest}", host,
+             ["recv", "--login", login, "--into", dest, "--keep"],
+             feed=feed, label=f"sending to {tail(dest)}", total=total,
+             progress=progress)
+
+    arrived = manifest_of(serve_value(
+        host, ["manifest", "--login", login, "--path", dest]))
+    compare(sent, arrived, "on the cluster")
+    return 0
+
+
+def stream_down(host, login, sources, dest, contents, progress):
+    """Cluster -> relay host -> laptop, as one pipe."""
+    into = Path(dest).expanduser()
+    named_dir = dest.rstrip().endswith("/") or into.is_dir()
+    for index, source in enumerate(sources):
+        kind = serve_value(host, ["probe", "--login", login, "--path", source,
+                                  "--keep"])
+        if kind == "absent":
+            die(f"{source} does not exist on the cluster",
+                *(["it looks like a pattern, and nothing expands one on that "
+                   "side: no shell sees it, and rclone does not either",
+                   "select files with --include / --exclude instead"]
+                  if any(c in source for c in GLOB_CHARS) else []))
+        want = manifest_of(serve_value(
+            host, ["manifest", "--login", login, "--path", source, "--keep"]))
+        take_contents = (contents or source.rstrip().endswith("/")) and kind == "dir"
+        root, _sep, name = source.rstrip("/").rpartition("/")
+        if not root:
+            # `/x` sits in `/`; a bare `x` is relative to the cluster home.
+            root = "/" if source.startswith("/") else "."
+        if not take_contents and name in ("", "~"):
+            die(f"{source or 'an empty path'} names the whole home directory",
+                "to copy what is in it, write it as ~/")
+        last = index == len(sources) - 1
+
+        if kind.startswith("file") and not named_dir and len(sources) == 1:
+            # DEST names the file itself.
+            into.parent.mkdir(parents=True, exist_ok=True)
+            size = int(kind.split()[1])
+            streamed(f"from {source}", host,
+                     ["read", "--login", login, "--path", source]
+                     + ([] if last else ["--keep"]),
+                     drain=["sh", "-c", f"cat > {shlex.quote(str(into))}"],
+                     label=f"fetching {tail(name)}", total=size, progress=progress)
+            got = into.stat().st_size if into.exists() else -1
+            if got < size:
+                die(f"{into} is {got} bytes here, expected {size}",
+                    "the stream was cut short")
+            continue
+
+        arriving = prefixed(want, "" if take_contents else name)
+        clashes = case_clashes(into, arriving)
+        if clashes:
+            die(f"{into} cannot hold names that differ only in case, and "
+                f"{source} would bring {len(clashes)} of them",
+                "clashing: " + ", ".join(clashes[:6])
+                + (", ..." if len(clashes) > 6 else ""),
+                "nothing was written; fetch into a case-sensitive volume, or "
+                "select files with --include / --exclude")
+        into.mkdir(parents=True, exist_ok=True)
+        args = ["send", "--login", login, "--from",
+                ((source.rstrip("/") or source) if take_contents else root),
+                "--name", ("." if take_contents else name)]
+        streamed(f"from {source}", host, args + ([] if last else ["--keep"]),
+                 drain=tar_argv("-xf", "-C", str(into)),
+                 label=f"fetching {tail(name)}", total=sum(want.values()),
+                 progress=progress)
+        compare(arriving, local_manifest(into), "here")
+    return 0
+
+
+# --- the long way round: through the relay host's disk ----------------------
+#: Only for requests tar cannot carry (see NEEDS_RCLONE). Everything else
+#: streams, and never touches this file.
+def stage_up(host, stage, sources, args, spots, progress):
+    contents = len(sources) == 1 and sources[0].rstrip().endswith("/")
+    targets = []
+    for path in sources:
+        if len(sources) > 1 and path.rstrip().endswith("/"):
+            die("a trailing slash copies the contents of one directory",
+                f"{path} is one of {len(sources)} sources; name it without the "
+                "slash, or transfer it on its own")
+        target = local_path(path)
+        if not target.exists():
+            die(f"{path} does not exist here",
+                "from this machine a cluster path needs its login, as in "
+                "LOGIN:/path/...")
+        targets.append(target)
+
+    names = [t.name for t in targets]
+    repeated = sorted({n for n in names if names.count(n) > 1})
+    if repeated:
+        note(f"warning: more than one source is called {', '.join(repeated)}; "
+             "the last one will win at the destination")
+
+    # Refuse before moving a byte rather than filling the relay host's disk and
+    # failing halfway: that is the failure that leaves the most mess behind.
+    size = sum(local_bytes(t) for t in targets)
+    room = free_bytes(host, STAGE_ROOT)
+    if room is not None and size > room * 0.95:
+        die(f"{human(size)} will not stage on the relay host "
+            f"({human(room)} free)",
+            "the relay copies through its own disk; free some space, or split "
+            "the transfer")
+
+    # A trailing slash means "the contents of", on both hops. Keeping it on the
+    # rsync source and on what the relay is then told to copy is what makes the
+    # two hops mean the same thing as one.
+    if progress:
+        note(f"staging {human(size)} to the relay host")
+    from_here = ([str(targets[0]) + "/"] if contents
+                 else [str(t) for t in targets])
+    rc = rsync_riding("staging", from_here, (host, f"{stage}/"), progress)
+    if rc != 0:
+        die(f"could not stage on the relay host (rsync exit {rc})")
+
+    for spot, target in zip(spots, targets):
+        args[spot] = f"{stage}/" if contents else f"{stage}/{target.name}"
+    return forward(host, ["transfer"] + args)
+
+
+def stage_down(host, stage, local_dest, args, spot, cluster_paths, original,
+               progress):
+    many = len(cluster_paths) > 1
+    contents = (not many and cluster_paths[0].rstrip().endswith("/")
+                or wants(original, "--contents"))
+    args[spot] = f"{stage}/"
+    rc = forward(host, ["transfer"] + args)
+    if rc != 0:
+        return rc
+
+    staged, dirs, want = stage_report(host, stage)
+    if not staged:
+        die("the relay host reported success but staged nothing",
+            "nothing was delivered, so this transfer did not happen")
+    if not (contents or many) and len(staged) != 1:
+        die(f"expected one staged item, found {len(staged)}: " + " ".join(staged))
+
+    dest = str(local_path(local_dest))
+    names = ()
+    if contents or many or staged[0] in dirs or os.path.isdir(dest):
+        # Everything staged goes into DEST, which is what rsync would make of
+        # one item too, unless it is a file landing as DEST itself. The items
+        # are named in rsync's file list, so DEST keeps its own mode rather
+        # than taking the staging directory's.
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except OSError as exc:
+            die(f"cannot make the directory {local_dest}: {exc.strerror or exc}")
+        source, dest_arg, names = (host, f"{stage}/"), dest + "/", staged
+        delivered = [os.path.join(dest, name) for name in staged]
+    else:
+        # A file that becomes DEST: its name is free to change, and a plain one
+        # needs no quoting on the rsync command line.
+        name = staged[0]
+        if shlex.quote(name) != name:
+            remote(host, sh_line('mv -- "$1/$2" "$1/file"', stage, name),
+                   capture=True)
+            name = "file"
+        source, dest_arg, delivered = (host, f"{stage}/{name}"), dest, [dest]
+    if progress:
+        note(f"fetching {human(want)} from the relay host")
+    rc = rsync_riding("fetching", [source], dest_arg, progress, names)
+    if rc != 0:
+        die(f"could not fetch {local_dest} from the relay host (rsync exit {rc})")
+
+    # The relay host's own `cluster transfer` vouched for the cluster hop; this
+    # is the hop it cannot see. Only what was delivered is counted: whatever
+    # the destination already held is not evidence either way.
+    landed = sum(local_bytes(path) for path in delivered)
+    if landed < want:
+        die(f"{local_dest} received {human(landed)}, expected {human(want)}",
+            "the fetch from the relay host was cut short")
+    return 0
+
+
+# --- the relay-host half: a pipe that holds the lease -----------------------
+def serve(argv):
+    """Run on the relay host: pipe stdin/stdout to the cluster, holding the lease.
+
+    Opening the shared, reference-counted connection through the tool's own
+    Transfers takes a lease, so no other run finishing can close it under the
+    stream; the finally gives it back. Only the far side's bytes go to stdout,
+    which for `send` is the tar stream. A connection that could not be opened
+    is REFUSED or LOST (_open_failed), and one lost on the way is ssh's LOST.
+    """
+    parser = argparse.ArgumentParser(prog="cluster-relay --serve", add_help=False)
+    parser.add_argument("mode",
+                        choices=("probe", "manifest", "send", "recv", "read", "write"))
+    parser.add_argument("--login", default="")
+    parser.add_argument("--path", default="")
+    parser.add_argument("--into", default="")
+    parser.add_argument("--from", dest="source", default="")
+    parser.add_argument("--name", action="append", default=[])
+    parser.add_argument("--keep", action="store_true")
+    opts = parser.parse_args(argv)
+
+    sys.path.insert(0, CLUSTER_ROOT)
+    from clustertool.context import Context
+    from clustertool.sshmux import connection_failures
+    from clustertool.transfer import Transfers
+    from clustertool import registry
+
+    ctx = Context(registry.find(opts.login) if opts.login else None, explicit=False)
+    xfer = Transfers(ctx.logins)
+    try:
+        tag = xfer.open_connection(quiet=True)
+    except connection_failures() as exc:
+        return _open_failed(exc, ctx.logins)
+    try:
+        sock = ctx.state.xfer_socket(tag)
+        ssh = xfer.ssh_command_for(sock, None)
+        return subprocess.run(ssh + [_remote_script(opts)]).returncode
+    finally:
+        xfer.lease_drop(tag)
+        if not opts.keep:
+            xfer.close_connection(tag)
+
+
+def _open_failed(exc, logins):
+    """The status for a connection to the cluster that could not be opened.
+
+    REFUSED when the credentials were refused, so the client stops rather
+    than asking again. LOST for anything else, which may pass (the network,
+    a busy lock, sshproxy cut short, a secret file being rewritten), so the
+    client asks again as for any lost connection, and stops when it keeps
+    happening. The reason goes to stderr, which the client shows.
+    """
+    from clustertool.auth import failure_text, refused_by
+
+    detail = getattr(logins, "last_failure", "")
+    text = failure_text(exc, detail)
+    if not isinstance(exc, SystemExit):
+        print(f"{PROG}: could not open a connection to the cluster: {text}",
+              file=sys.stderr)
+    elif isinstance(exc.code, str):
+        # A ui.Die has said why already; a SystemExit with text has not.
+        print(exc.code, file=sys.stderr)
+    return REFUSED if refused_by(exc, detail) else LOST
+
+
+def _remote_script(opts):
+    """The one shell command the cluster runs for this stream.
+
+    A path means what it means to every other command of the tool (`~/x` is
+    in the home directory, and nothing is read as an option), because it goes
+    through the package's remote_path: serve has put the package on sys.path.
+    """
+    from clustertool.remote_sh import remote_path
+
+    if opts.mode == "probe":
+        path = remote_path(opts.path)
+        return (f'if [ -d {path} ]; then echo dir; '
+                f'elif [ -e {path} ]; then echo "file $(wc -c < {path})"; '
+                f'else echo absent; fi')
+    if opts.mode == "manifest":
+        # Sizes by path, relative to the directory being described, so the two
+        # ends can be compared without either knowing the other's layout.
+        path = remote_path(opts.path)
+        return (f'if [ -d {path} ]; then cd {path} && '
+                f'find . -type f -printf "%s %p\\0"; '
+                f'elif [ -e {path} ]; then printf "%s ." "$(wc -c < {path})"; fi')
+    if opts.mode == "send":
+        names = " ".join(shlex.quote(member(n)) for n in opts.name)
+        return f"tar -cf - -C {remote_path(opts.source)} {names}"
+    if opts.mode == "recv":
+        # A tar made on macOS can carry extended attributes in pax headers GNU
+        # tar does not know. It drops them either way; this keeps it from
+        # warning once per file.
+        into = remote_path(opts.into)
+        return (f"mkdir -p {into} && "
+                f"tar -xf - --warning=no-unknown-keyword -C {into}")
+    if opts.mode == "read":
+        return f"cat {remote_path(opts.path)}"
+    into = remote_path(opts.into)
+    return f'mkdir -p -- "$(dirname -- {into})" && cat > {into}'
+
+
+# --- everything else --------------------------------------------------------
+def forward(host, args, tty=None):
+    """Run a cluster command on the relay host, unchanged."""
+    if tty is None:
+        tty = sys.stdin.isatty() and sys.stdout.isatty()
+    return remote(host, relay_line(args), tty=tty).returncode
+
+
+def _exit_on(signum, _frame):
+    """Turn a kill into an orderly exit, so the staging cleanup still runs.
+
+    SIGTERM and SIGHUP would otherwise leave the staged copy on the relay host,
+    and SIGHUP is what closing the terminal sends to a running transfer.
+    """
+    raise SystemExit(128 + signum)
+
+
+def _unwind_on_signals():
+    """Make SIGTERM and SIGHUP exit through every ``finally``; see _exit_on.
+
+    A signal this process was started ignoring stays ignored.
+    """
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            if signal.getsignal(sig) != signal.SIG_IGN:
+                signal.signal(sig, _exit_on)
+        except (OSError, ValueError):
+            pass
+
+
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "--serve":
+        # Running on the relay host, as the far end of somebody's pipe. Its
+        # finally hands the transfer lease back and closes the connection it
+        # opened, so a signal must unwind it too, or that master outlives it.
+        _unwind_on_signals()
+        return serve(args[1:])
+    if not relay_setting("HOST") and (not args or args[0] in ("-h", "--help", "help")):
+        # With a relay host, help comes from the tool there; without one, this
+        # is the help that says how to name it.
+        print(usage(), end="")
+        return 0 if args else 2
+    _unwind_on_signals()
+    host = relay_host()
+    if args and args[0] in ("transfer", "xfer", "copy", "cp"):
+        rest = args[1:]
+        if any(a in ("--close", "-h", "--help", "help") for a in rest):
+            return forward(host, args)
+        return relay_transfer(host, rest)
+    return forward(host, args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

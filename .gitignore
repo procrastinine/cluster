@@ -1,0 +1,22 @@
+# Nothing secret or machine-specific belongs in this repo. Credentials live in
+# $XDG_CONFIG_HOME/cluster/credentials/<backend>/ and state in
+# $XDG_STATE_HOME/cluster/, both outside the tree; these patterns keep an
+# accidental copy of either out of a commit.
+/credentials/
+/fasrc/
+/nersc/
+user
+pass
+key.txt
+*.pem
+*-cert.pub
+id_rsa*
+id_ed25519*
+secrets/
+
+# local scratch
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.log

@@ -1,0 +1,3176 @@
+#!/usr/bin/env python3
+"""nersc — drive NERSC Perlmutter from another cluster's login node.
+
+Treats NERSC as one more Slurm backend: the Slurm verbs (sbatch, squeue,
+sacct, scancel, ...) pass through verbatim over a persistent multiplexed SSH
+connection, plus rsync-based push/pull/sync that go through a NERSC DTN so
+bulk bytes never ride the login-node channel budget.
+
+Authentication is a 24-hour sshproxy certificate installed at ~/.ssh/nersc-bridge
+by `cluster bridge push` on the workstation, normally from cron. Nothing here
+can renew the certificate — if it expires, the remedy is on the workstation
+and every error message says so.
+
+Runs on the hub's system python3 (3.6 or newer): no f-string-only
+features beyond 3.6, no subprocess capture_output/text kwargs.
+
+Project-specific behaviour (how a submitter is launched, which inputs it needs
+staged, what a job return may skip) comes from an optional hooks file named by
+`hooks = PATH` in the config; see docs/nersc-bridge.md in the cluster repo.
+
+Verbs:
+  Slurm passthrough:  sbatch squeue sacct scancel sinfo scontrol sstat sprio
+                      sshare sqs
+  sbatch --return [--cleanup] [--run-dir D] [--dest D] ...
+                      submit AND register the run dir for automatic return to
+                      this cluster when the job finishes (run dir defaults to --chdir)
+  track [--cleanup] JOBID SRC [DEST]   register an already-submitted job
+  reap [--list] [--max-seconds=N]
+                      one idempotent pass: pull finished tracked run dirs back
+                      here atomically (run it periodically, e.g. from cron);
+                      with N, no new pull starts after N seconds (0: no
+                      limit, the default); SIGTERM ends a pass cleanly
+  q / jobs            compact `squeue --me` snapshot
+  peek JOBID [FILE] [-n N]   inspect a job from here: state + run-dir listing +
+                      tail of its output (or FILE) — no paths needed
+  fetch JOBID [DEST]  copy a job's run dir here right now, by id alone —
+                      works mid-run for partials; rerun to refresh
+  run [--cd DIR] CMD  run argv on a NERSC login node (no shell expansion there)
+  sh 'LINE'           run a line under `bash -lc` (use for $PSCRATCH, ~, pipes)
+  shell               interactive login shell
+  push SRC DEST       rsync here -> NERSC via a DTN (cp-like, args pass through)
+  pull SRC DEST       rsync NERSC -> here via a DTN
+  sync [--dry-run]    mirror the code tree (mirror_src) to NERSC (mirror_dest)
+  submit [--no-sync] [--cd DIR] -- CMD   sync, then run CMD remotely in the mirror
+  submit ARGS         the project's default form, when a hooks file defines one
+  status [--quick]    health: certificate, connection, jobs, mirror age
+                      (--quick: this machine only, no remote call)
+  doctor              probe connectivity end to end
+  config              the effective configuration, key by key
+  cert                certificate validity
+  connect/disconnect  explicit master control (normally automatic)
+"""
+
+import errno
+import fcntl
+import json
+import math
+import os
+import re
+import shlex
+import selectors
+import shutil
+import signal
+import socket as socketlib
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from stat import S_ISDIR as stat_is_dir, S_ISLNK as stat_is_link
+
+VERSION = "2.1"
+
+# Editing the installed copy in place is safe: `cluster bridge push` compares
+# it with what it last installed before shipping anything, and never overwrites
+# an edit made here.  Whether such an edit is adopted into the repository or
+# reported as a conflict is the workstation's COMPANION_ADOPT_HUB_EDITS.
+# Behaviour that belongs to one project goes in its hooks file, not here.
+
+# Diagnostics: `kill -USR1 <pid>` makes a running (or apparently stuck) nersc
+# print the Python stack of every thread to stderr and keep going, so a hang
+# can be located in one step instead of inferred from /proc.
+try:
+    import faulthandler
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True,
+                          chain=False)
+except (ImportError, AttributeError, ValueError, OSError):
+    pass
+
+# NERSC_CONFIG and NERSC_STATE_DIR relocate both trees; the workstation entry
+# point (bin/nersc in the cluster repo) points them into cluster's own.
+CONFIG_PATH = Path(os.path.expanduser(
+    os.environ.get("NERSC_CONFIG") or "~/.config/nersc/config"))
+EXCLUDE_PATH = CONFIG_PATH.parent / "mirror.exclude"
+STATE_DIR = Path(os.path.expanduser(
+    os.environ.get("NERSC_STATE_DIR") or "~/.local/state/nersc"))
+
+DEFAULTS = {
+    "user": "",
+    "pool": "perlmutter.nersc.gov",
+    "dtns": "dtn01.nersc.gov dtn02.nersc.gov dtn03.nersc.gov dtn04.nersc.gov",
+    "key": "~/.ssh/nersc-bridge",
+    "scratch": "",            # /pscratch/sd/<u>/<user>; substituted for $PSCRATCH/$SCRATCH
+    "cfs": "",                # CFS project dir; substituted for $CFS
+    # One-way code mirror for `sync`/`submit`: a local tree and its NERSC
+    # home-relative destination.  Unset means there is no mirror.
+    "mirror_src": "",
+    "mirror_dest": "",
+    # Where returned run dirs land on this cluster: <scratch>/X returns to
+    # <return_root>/X.  Unset means every return needs an explicit DEST.
+    "return_root": "",
+    # Optional home-relative name of a symlink to scratch on NERSC (for
+    # example `runs`), so `runs/X` maps like <scratch>/X.
+    "scratch_link": "",
+    # Optional Python file with project hooks; see load_hooks().
+    "hooks": "",
+    # job-return registry on NERSC; empty = <scratch>/.nersc-return
+    "return_queue": "",
+    # auto checks only when the mirror carries a .venv; on forces the check,
+    # off disables it.
+    "env_parity": "auto",
+    "refresh_hint": "renew it on the workstation with `cluster bridge push` "
+                    "(normally run from cron)",
+    # Connections and waits, in seconds unless said otherwise.  A failed
+    # connection is tried again by FailureMemory's rule: connect_retries in
+    # quick succession, after waits from connect_retry_delay doubling up to
+    # connect_retry_delay_max, with connect_half_life seconds of a working
+    # connection halving the count.
+    "connect_timeout": "25",
+    "connect_retries": "2",
+    "connect_retry_delay": "2",
+    "connect_retry_delay_max": "60",
+    "connect_half_life": "300",
+    "alive_interval": "30",
+    "alive_count_max": "10",
+    "master_ready_wait": "8",
+    "dtn_probe_timeout": "5",
+    "no_progress_seconds": "180",
+    "lock_patience": "30",
+    # At least REAP_LOCK_STALE_FLOOR, since a live pass must never lose it.
+    "reap_lock_stale_seconds": "900",
+}
+
+SLURM_VERBS = ("sbatch", "squeue", "sacct", "scancel", "sinfo", "scontrol",
+               "sstat", "sprio", "sshare", "sqs")
+
+
+def _config_file_values():
+    """{key: value} for the `key = value` lines of the config file, if any."""
+    values = {}
+    if CONFIG_PATH.is_file():
+        for line in CONFIG_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip()
+    return values
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    cfg.update(_config_file_values())
+    return cfg
+
+
+CFG = load_config()
+
+#: Keys whose unusable value has been reported, so each is said once a run.
+_REPORTED = set()
+
+
+def cfg_number(key):
+    """A number of 0 or more from the config, or its default, saying so once
+    when the configured value is not one."""
+    raw = str(CFG.get(key, "")).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if 0 <= value < float("inf"):
+        return value
+    if key not in _REPORTED:
+        _REPORTED.add(key)
+        sys.stderr.write("nersc: %s = %r in %s is not a number of 0 or more; "
+                         "using %s\n" % (key, raw, CONFIG_PATH, DEFAULTS[key]))
+    return float(DEFAULTS[key])
+
+
+def die(message, *hints):
+    sys.stderr.write("nersc: %s\n" % message)
+    for hint in hints:
+        sys.stderr.write("  %s\n" % hint)
+    sys.exit(1)
+
+
+class Terminated(BaseException):
+    """SIGTERM or SIGHUP, raised wherever this process is.
+
+    Raised rather than obeyed, so that every ``finally`` still runs, as for
+    Ctrl-C: a transfer in progress is asked to stop, and a reap pass saves
+    its state and lets go of its lock.  A BaseException, so that no
+    ``except Exception`` on the way swallows it.
+    """
+
+    def __init__(self, signum):
+        BaseException.__init__(self, signum)
+        self.signum = signum
+        #: The exit status a shell reports for a process this signal ended.
+        self.code = 128 + signum
+
+
+def _raise_terminated(signum, _frame):
+    raise Terminated(signum)
+
+
+def unwind_on_signals():
+    """Make SIGTERM and SIGHUP raise Terminated.
+
+    A signal this process was started ignoring stays ignored: under nohup,
+    SIGHUP is meant to change nothing.
+    """
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            if signal.getsignal(signum) != signal.SIG_IGN:
+                signal.signal(signum, _raise_terminated)
+        except (OSError, ValueError):
+            pass
+
+
+def _signal_name(stop):
+    """"SIGTERM" for a Terminated, "Ctrl-C" for a KeyboardInterrupt."""
+    if isinstance(stop, Terminated):
+        try:
+            return signal.Signals(stop.signum).name
+        except ValueError:
+            return "signal %d" % stop.signum
+    return "Ctrl-C"
+
+
+def _configured_path(key):
+    """A path-valued setting, expanded; "" when unset."""
+    value = (CFG.get(key) or "").strip()
+    return os.path.expanduser(value) if value else ""
+
+
+def return_root():
+    return _configured_path("return_root")
+
+
+def mirror_src():
+    return _configured_path("mirror_src")
+
+
+# --------------------------------------------------------------------------
+# project hooks
+#
+# A hooks file is ordinary Python (3.6-compatible, stdlib only) named by
+# `hooks = PATH` in the config.  Everything in it is optional:
+#
+#   submit_argv(args, tool) -> list | None
+#       Rewrite the default (non `--`) `nersc submit ARGS` form into the
+#       remote command -- a venv launcher, injected flags.  None means ARGS
+#       run verbatim.
+#   submit_inputs(argv, tool) -> [local paths]
+#       Inputs the rewritten command needs on NERSC; each is staged to its
+#       parity path (return_root <-> scratch, mirror_src <-> mirror_dest).
+#   SUBMIT_INPUT_EXCLUDES = (rsync patterns, ...)
+#       Applied when a staged input is a whole directory.
+#   return_excludes(tool) -> [rsync patterns]
+#       Excluded from every job return (reap, fetch).
+#
+# `tool` is a live view of this module: tool.CFG, tool.die(message, *hints),
+# tool.expand_remote(path), and so on.
+# --------------------------------------------------------------------------
+
+class _Tool(object):
+    """What a hooks file sees as ``tool``: this module's globals, read at the
+    moment of use, so a replaced CFG is the one a hook sees."""
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name)
+
+
+TOOL = _Tool()
+
+
+def load_hooks():
+    """(module or None, error text or None) for the configured hooks file."""
+    path = _configured_path("hooks")
+    if not path:
+        return None, None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("nersc_project_hooks", path)
+        if spec is None or spec.loader is None:
+            raise ImportError("not a Python source file")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as exc:  # a broken hooks file must not break the tool
+        return None, "%s: %s" % (type(exc).__name__, exc)
+    return module, None
+
+
+HOOKS, HOOKS_ERROR = load_hooks()
+if HOOKS_ERROR:
+    sys.stderr.write("nersc: hooks file %s failed to load (%s); continuing "
+                     "without project hooks\n" % (CFG.get("hooks"), HOOKS_ERROR))
+
+#: Patterns left out when a staged submit input is a whole directory.
+SUBMIT_INPUT_EXCLUDES = tuple(getattr(HOOKS, "SUBMIT_INPUT_EXCLUDES", ()) or ())
+
+
+def _hook(name):
+    return getattr(HOOKS, name, None) if HOOKS is not None else None
+
+
+def key_path():
+    return Path(os.path.expanduser(CFG["key"]))
+
+
+def cert_file():
+    kp = key_path()
+    return kp.with_name(kp.name + "-cert.pub")
+
+
+def target():
+    if not CFG["user"]:
+        die("no NERSC user configured",
+            "expected `user = ...` in %s (written when the companion is installed)"
+            % CONFIG_PATH)
+    return "%s@%s" % (CFG["user"], CFG["pool"])
+
+
+# --------------------------------------------------------------------------
+# certificate
+# --------------------------------------------------------------------------
+
+def cert_valid_until():
+    """Naive local datetime the certificate expires, or None."""
+    if not cert_file().is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            ["ssh-keygen", "-L", "-f", str(cert_file())],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            universal_newlines=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if "Valid:" in line and len(parts) >= 5 and parts[3] == "to":
+            try:
+                return datetime.strptime(parts[4], "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                return None
+    return None
+
+
+def cert_seconds_left():
+    until = cert_valid_until()
+    if until is None:
+        return None
+    return (until - datetime.now()).total_seconds()
+
+
+def describe_cert():
+    left = cert_seconds_left()
+    if left is None:
+        if not key_path().is_file():
+            return "missing"
+        return "unreadable"
+    if left <= 0:
+        return "EXPIRED %s ago" % _ago(-left)
+    return "valid for %s" % _ago(left)
+
+
+def _ago(seconds):
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return "%dh%02dm" % (seconds // 3600, (seconds % 3600) // 60)
+    if seconds >= 60:
+        return "%dm" % (seconds // 60)
+    return "%ds" % seconds
+
+
+def require_cert():
+    left = cert_seconds_left()
+    if left is None:
+        die("no NERSC certificate at %s" % cert_file(),
+            "it is installed from the workstation: run `cluster bridge push` there",
+            CFG["refresh_hint"])
+    if left <= 0:
+        die("the NERSC certificate expired %s ago" % _ago(-left),
+            "nothing on this side can renew it; %s" % CFG["refresh_hint"],
+            "if the workstation has been offline, run `cluster bridge push` there by hand")
+
+
+#: NERSC signs its host keys with this CA; one line covers every *.nersc.gov node.
+CERT_AUTHORITY = (
+    "@cert-authority *.nersc.gov ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEA2yKBpvRbdD9MWiu"
+    "+7wg17vBsKy46AjjuL27DmdpDYiCqRE2mN0om9b0jn4eI91RGykbcRa9wUKJ2qaD0zsD08A8HM+R14H"
+    "4UsZ5hi7S+xGqscJH7uTmXy5Igo5xEOahS9Z+ecgonDCgWKJnbd/FRu4vITYXrvTlIIGHGRBYj0GzbgL"
+    "HBzedoMaGNRwhVyadH2SGRaZCgbH+Swevzy0GwYfZJA9zd7EX0jiAClkSYcflIOsygmI3gHv+b35mrvX"
+    "cHDeQOR/wg8knfpSiFLCkVDpfgnj27Lemzxe6k61Brhv9CUiq+t7WApVDBovhdXZn6pBg+OKeDk1G1OL"
+    "vRbxJ2bw=="
+)
+
+
+def ensure_known_hosts():
+    path = Path.home() / ".ssh" / "known_hosts"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text() if path.is_file() else ""
+    if "cert-authority *.nersc.gov" in existing:
+        return
+    with path.open("a") as handle:
+        if existing and not existing.endswith("\n"):
+            handle.write("\n")
+        handle.write(CERT_AUTHORITY + "\n")
+
+
+# --------------------------------------------------------------------------
+# progress policy
+#
+# There are no wall-clock deadlines in this tool: a pull of a huge run
+# directory and a two-second `mv` may each take as long as they need.  What
+# is never allowed is SILENCE.  Every remote call streams, and every remote
+# call is made to emit progress (the reap deletes with `rm -rfv`, rsync runs
+# with --out-format), so "nothing has arrived for a while" means the far side
+# is wedged rather than busy, which is what a remote process parked in
+# unrecovered Lustre I/O looks like.
+#
+# no_progress_seconds is therefore an INACTIVITY window, reset by every byte
+# of output, never a budget for the operation.  0 disables abandonment
+# (diagnostics still print), and NERSC_NO_PROGRESS_SECONDS overrides the
+# configured window for one run.
+PROGRESS_TICK_SECONDS = 15
+
+
+def no_progress_seconds():
+    raw = os.environ.get("NERSC_NO_PROGRESS_SECONDS", "")
+    if raw.strip():
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            sys.stderr.write("nersc: ignoring unparsable "
+                             "NERSC_NO_PROGRESS_SECONDS=%r\n" % raw)
+    return cfg_number("no_progress_seconds")
+
+
+def rsync_stall_flag():
+    """rsync's own I/O-inactivity guard, from the same policy.
+
+    rsync --timeout is not a wall clock either: it fires only when no data
+    has moved for that long, so a slow-but-live transfer is never cut off.
+    0 means "no timeout" to rsync, matching the disable switch.
+    """
+    return "--timeout=%d" % int(no_progress_seconds())
+
+
+# --------------------------------------------------------------------------
+# connection
+# --------------------------------------------------------------------------
+
+#: The socket directory once it has been checked; see sock_dir().
+_SOCK_DIR = None
+
+
+def _private_dir_problem(path):
+    """Why *path* is unfit to hold this user's control socket, or None.
+
+    It must be a real directory (not a symlink), owned by this user, and
+    closed to everyone else.  A group- or world-accessible mode on a directory
+    we own is tightened here rather than reported.
+    """
+    try:
+        info = os.lstat(str(path))
+    except OSError as exc:
+        return "cannot inspect it (%s)" % exc.strerror
+    if stat_is_link(info.st_mode):
+        return "it is a symlink"
+    if not stat_is_dir(info.st_mode):
+        return "it is not a directory"
+    if info.st_uid != os.getuid():
+        return "it belongs to uid %d, not to you (uid %d)" % (info.st_uid, os.getuid())
+    if info.st_mode & 0o077:
+        try:
+            os.chmod(str(path), 0o700)
+        except OSError as exc:
+            return "its mode is %o and cannot be made 700 (%s)" % (
+                info.st_mode & 0o777, exc.strerror)
+    return None
+
+
+def sock_dir():
+    """Node-local directory for the control socket.
+
+    A cluster home is usually NFS-shared across login nodes and a unix socket is only
+    connectable from the host that bound it, so the socket must live on local
+    disk; each login node gets its own master.
+
+    Without $XDG_RUNTIME_DIR the directory is /tmp/nersc-<uid>, a name anyone
+    on the node can create first.  Whoever controls it controls the socket,
+    the lock and the log this tool opens there, so it is used only when it is
+    a real directory of ours that nobody else can enter.
+    """
+    global _SOCK_DIR
+    if _SOCK_DIR is not None:
+        return _SOCK_DIR
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime and os.path.isdir(runtime):
+        base = Path(runtime) / "nersc"
+    else:
+        base = Path("/tmp") / ("nersc-%d" % os.getuid())
+    try:
+        os.mkdir(str(base), 0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        die("cannot create the connection directory %s: %s" % (base, exc.strerror),
+            "set XDG_RUNTIME_DIR to a private directory on this node's local disk")
+    problem = _private_dir_problem(base)
+    if problem:
+        die("refusing to use %s for the NERSC connection: %s" % (base, problem),
+            "it holds this tool's control socket, so it must be a directory "
+            "you own with mode 700",
+            "if it is yours, remove it (rm -rf %s) and rerun; otherwise set "
+            "XDG_RUNTIME_DIR to a private directory on this node's local disk"
+            % base)
+    _SOCK_DIR = base
+    return base
+
+
+def sock_path():
+    return sock_dir() / "mux.sock"
+
+
+def connect_timeout():
+    """Seconds ssh waits for NERSC to answer a connection: connect_timeout,
+    and at least one, since ssh reads 0 as the system's own TCP timeout."""
+    return max(1, int(cfg_number("connect_timeout")))
+
+
+def base_ssh(batch=True):
+    argv = [
+        "ssh", "-F", "/dev/null",
+        "-i", str(key_path()),
+        "-o", "IdentitiesOnly=yes",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
+        "-o", "ConnectTimeout=%d" % connect_timeout(),
+    ]
+    if batch:
+        argv += ["-o", "BatchMode=yes"]
+    return argv
+
+
+def master_alive():
+    if not sock_path().exists():
+        return False
+    try:
+        proc = subprocess.run(
+            ["ssh", "-F", "/dev/null", "-o", "ControlPath=%s" % sock_path(),
+             "-O", "check", "dummy"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=PROGRESS_TICK_SECONDS)
+    except subprocess.TimeoutExpired:
+        # A wedged master still accepts the socket but never answers.  Call
+        # it dead so ensure_master replaces it, instead of every later
+        # command inheriting the wedge.
+        return False
+    return proc.returncode == 0
+
+
+class FailureMemory(object):
+    """Recent failures, remembered less the longer things go well between them.
+
+    The rule the workstation's own reconnects follow (clustertool.backoff),
+    in this file's terms, since the hub has only this file: each failure adds
+    one to a score, and every healthy second fades it with *half_life* (0
+    forgets at once).  The wait before the next try starts at *delay* and
+    doubles with the score, up to *delay_max*, and a score past *limit* is
+    time to stop.  So drops spread over a long run never add up, and a burst
+    of them does.  The score stops at the ceiling where one more failure
+    changes nothing, so a long outage is forgotten as fast as a burst.
+    """
+
+    def __init__(self, half_life, limit, delay, delay_max):
+        self.half_life = max(0.0, float(half_life))
+        self.limit = limit
+        self.delay = max(0.0, float(delay))
+        self.delay_max = max(self.delay, float(delay_max))
+        self.score = 0.0
+
+    def failed(self, healthy=0.0):
+        """Count a failure after *healthy* seconds of things going well."""
+        if healthy > 0 and self.score:
+            if self.half_life:
+                self.score *= 0.5 ** (healthy / self.half_life)
+            else:
+                self.score = 0.0
+        self.score = min(self.score + 1.0, self.ceiling)
+        return self.score
+
+    @property
+    def ceiling(self):
+        """The score whose wait has reached *delay_max*, or one past *limit*
+        if that is higher: past it, a failure changes nothing."""
+        steps = math.ceil(math.log2(self.delay_max / self.delay)) if self.delay else 0
+        top = 1.0 + steps
+        return top if self.limit is None else max(top, self.limit + 1.0)
+
+    @property
+    def exhausted(self):
+        return self.limit is not None and self.score > self.limit
+
+    @property
+    def fresh(self):
+        """How many recent failures the score amounts to."""
+        return int(round(self.score))
+
+    def wait(self):
+        """Seconds to wait before the next try."""
+        steps = self.score - 1.0
+        if steps < 0:
+            return 0.0
+        return min(self.delay_max, self.delay * 2.0 ** min(steps, 64.0))
+
+
+#: This run's connection failures, and when the last one was.
+_CONNECTION = {"memory": None, "last": None}
+
+
+def connection_failed(healthy):
+    """Count one failure of the connection to NERSC, after *healthy* seconds
+    of it working, and return the run's FailureMemory."""
+    memory = _CONNECTION["memory"]
+    if memory is None:
+        memory = _CONNECTION["memory"] = FailureMemory(
+            cfg_number("connect_half_life"), int(cfg_number("connect_retries")),
+            cfg_number("connect_retry_delay"), cfg_number("connect_retry_delay_max"))
+    memory.failed(healthy)
+    _CONNECTION["last"] = time.time()
+    return memory
+
+
+def _since_last_failure():
+    """Seconds since this run's last connection failure, or 0 for none."""
+    last = _CONNECTION["last"]
+    return max(0.0, time.time() - last) if last is not None else 0.0
+
+
+#: What ssh logs when NERSC turned the credentials away, or the host was not
+#: the one expected: trying again would only be refused again.
+SSH_REFUSAL = re.compile(r"(?i)permission denied|too many authentication "
+                         r"failures|authentication failed|host key "
+                         r"verification failed")
+
+
+def ensure_master(quiet=True):
+    """Open the multiplexed connection if it is not already up.
+
+    Concurrent callers race for one master: creation happens under a lock, and
+    losing the race is success (the winner's socket is used).  An attempt
+    that fails is tried again, after a wait, by FailureMemory's rule (the
+    connect_* settings); one that NERSC refused is not.
+    """
+    if master_alive():
+        return
+    require_cert()
+    ensure_known_hosts()
+    lock_file = (sock_dir() / "mux.lock").open("w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if master_alive():
+            return
+        try:
+            sock_path().unlink()
+        except OSError:
+            pass
+        if not quiet:
+            sys.stderr.write("nersc: opening connection to %s...\n" % CFG["pool"])
+        log = sock_dir() / "master.log"
+        # The time since this run's last failure was spent working; the time
+        # after a failed attempt here is spent waiting, and counts for nothing.
+        healthy = _since_last_failure()
+        while True:
+            said = _open_master(log)
+            if said is None:
+                return
+            memory = connection_failed(healthy)
+            healthy = 0.0
+            if SSH_REFUSAL.search(said):
+                die("NERSC refused the connection: %s" % said,
+                    "certificate: %s" % describe_cert(),
+                    "trying again would only be refused again; %s"
+                    % CFG["refresh_hint"])
+            if memory.exhausted:
+                die("could not open a connection to NERSC after %d tries in "
+                    "quick succession" % memory.fresh,
+                    *([said] if said else []) + [
+                        "is %s reachable from this node?" % CFG["pool"],
+                        "certificate: %s" % describe_cert(),
+                        "connect_retries (%d) in %s is how many in quick "
+                        "succession are tried again" % (memory.limit, CONFIG_PATH)])
+            wait = memory.wait()
+            sys.stderr.write("nersc: could not open a connection to NERSC%s; "
+                             "trying again in %ds\n"
+                             % (" (%s)" % said if said else "", wait))
+            _pause(wait)
+    finally:
+        lock_file.close()
+
+
+def _open_master(log):
+    """One attempt at the master: None once it is up, else what ssh logged
+    this time: the line that says NERSC refused it, if one does (ssh may log
+    more after it, such as "Disconnected from"), else the last.
+
+    `ssh -f` returns once it has authenticated and forked, so an attempt
+    that has not returned in twice connect_timeout, plus ten seconds, is
+    stuck, and one that has is given master_ready_wait for its socket.
+    """
+    try:
+        start = log.stat().st_size
+    except OSError:
+        start = 0
+    # stdout/stderr must NOT be pipes: `ssh -f` daemonizes but the master
+    # child inherits them, so a reader would block until the master *exits*.
+    # Errors go to the -E log instead.
+    argv = base_ssh() + [
+        "-M", "-N", "-f", "-E", str(log),
+        "-o", "ControlPath=%s" % sock_path(),
+        "-o", "ControlPersist=yes",
+        "-o", "ServerAliveInterval=%d" % int(cfg_number("alive_interval")),
+        "-o", "ServerAliveCountMax=%d" % int(cfg_number("alive_count_max")),
+        target(),
+    ]
+    stuck = 2 * connect_timeout() + 10
+    try:
+        code = subprocess.run(argv, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=stuck).returncode
+    except subprocess.TimeoutExpired:
+        code = None
+    if code in (0, None):
+        deadline = time.time() + cfg_number("master_ready_wait")
+        while True:
+            if master_alive():
+                return None
+            if time.time() >= deadline:
+                break
+            time.sleep(0.25)
+    said = ""
+    try:
+        with log.open() as handle:
+            handle.seek(start)
+            lines = [line.strip() for line in handle.read().splitlines()
+                     if line.strip()]
+        refused = [line for line in lines if SSH_REFUSAL.search(line)]
+        said = refused[0] if refused else lines[-1] if lines else ""
+    except OSError:
+        pass
+    if code is None and not said:
+        said = "no answer in %ds" % stuck
+    return said
+
+
+def mux_ssh(extra=(), batch=True):
+    """ssh argv that prefers the shared master but survives its limits.
+
+    ControlMaster=auto plus full credentials: normally the command rides an
+    existing mux channel (~0.8s); when the master's session budget is spent
+    (sshd MaxSessions=10, which a dozen concurrent callers exceed), the client
+    falls back to a direct cert-authenticated connection (~2s extra) instead
+    of failing. The fallback never becomes a competing master: the socket is
+    taken, so ssh disables multiplexing for that one run.
+    """
+    argv = base_ssh(batch=batch) + [
+        "-o", "ControlPath=%s" % sock_path(),
+        "-o", "ControlMaster=auto",
+    ]
+    argv += list(extra)
+    argv.append(target())
+    return argv
+
+
+#: Called on every tick of a long wait, to show this process is still at
+#: work; a reap pass points it at its lock (see _reap_lock).
+ON_TICK = None
+
+
+def _tick():
+    if ON_TICK is not None:
+        ON_TICK()
+
+
+def _pause(seconds):
+    """time.sleep(*seconds*), ticking at its start and every
+    PROGRESS_TICK_SECONDS, so that a reap pass waiting to try again still
+    holds its lock."""
+    end = time.time() + seconds
+    while True:
+        _tick()
+        left = end - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(left, PROGRESS_TICK_SECONDS))
+
+
+def _run_child(argv):
+    """subprocess.run(argv).returncode, with the child asked to stop, not killed.
+
+    When this process is stopped (Ctrl-C, SIGTERM), the child gets SIGTERM
+    and a few seconds to act on it, which is how rsync keeps a partial file
+    under --partial and removes its temporary one otherwise; a SIGKILL would
+    leave that temporary file behind in the destination. Only a child that
+    does not stop in that time is killed.
+    """
+    proc = subprocess.Popen(argv)
+    try:
+        while True:
+            try:
+                return proc.wait(timeout=PROGRESS_TICK_SECONDS)
+            except subprocess.TimeoutExpired:
+                _tick()
+    except BaseException:
+        _stop_child(proc)
+        raise
+
+
+def _stop_child(proc, grace=10):
+    """SIGTERM, then SIGKILL after *grace* seconds; never waits unbounded."""
+    for send, wait in ((proc.terminate, grace), (proc.kill, 5)):
+        try:
+            send()
+            proc.wait(timeout=wait)
+            return
+        except OSError:
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _kill_group(proc):
+    """Kill an abandoned step and everything it started.
+
+    Never raises and never waits on the doomed process's pipes: this runs on
+    the failure path, where blocking would recreate the hang it exists to
+    end.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _describe_endpoint():
+    """Identify the connection a stall happened on.
+
+    Deliberately does NO remote I/O: an error path that can itself hang is
+    the bug this guard exists to remove.  Each login node owns its own
+    control socket, so pool + socket path names the endpoint.
+    """
+    return "%s via %s" % (CFG["pool"], sock_path())
+
+
+def _stall_report(label, silence, capture, last_line=None, seen_bytes=0):
+    sys.stderr.write(
+        "nersc: NO PROGRESS for %ds - abandoning this step.\n"
+        "  command : %s\n"
+        "  endpoint: %s\n"
+        "  got to  : %s\n"
+        "  meaning : the remote side accepted the command and then stopped\n"
+        "            producing output, which is what a process parked in\n"
+        "            unrecovered filesystem I/O looks like (a busy command\n"
+        "            would still be streaming).\n"
+        "  effect  : %s The tool continues; nothing is left half-waiting.\n"
+        "  next    : retry when storage is healthy, or set\n"
+        "            NERSC_NO_PROGRESS_SECONDS=0 to wait indefinitely.\n"
+        % (int(silence), label, _describe_endpoint(),
+           ("%d bytes; last thing that worked: %s"
+            % (seen_bytes, last_line[:120])) if last_line else
+           ("no output at all, so it wedged on its FIRST operation"),
+           "Output received so far is kept and used."
+           if capture else "The step is reported as failed."))
+    if not capture:
+        # Only the local end is stopped. The remote command is not told, and
+        # one parked in I/O goes on once storage recovers, so rerunning a
+        # submission blindly could run it twice.
+        sys.stderr.write(
+            "  remote  : the command may still be running on NERSC; before\n"
+            "            running it again, look: nersc q, or\n"
+            "            nersc sh 'ps -fu $USER'\n")
+    sys.stderr.flush()
+
+
+def _stream(argv, label, capture, merge_err=False, on_output=None):
+    """Run argv, streaming its output, and never block indefinitely.
+
+    Returns (returncode, captured_text); 124 means abandoned after silence,
+    with whatever had already streamed still returned.  With capture=False
+    output is passed through to stdout as it arrives, so interactive use is
+    unchanged.  *on_output*, when given, receives each chunk of stdout
+    instead, and nothing is kept or printed.
+
+    The reader is a selector over the raw pipes rather than communicate():
+    when a command rides the ssh mux, the MASTER holds duplicates of the
+    pipes' write ends, so after killing the client an unbounded
+    communicate() would wait on those duplicates forever.  Reading both
+    streams also removes the classic pipe-buffer deadlock.
+    """
+    limit = no_progress_seconds()
+    # Own process group: abandoning a step must not strand what it spawned.
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, start_new_session=True)
+    chunks = []
+    err_chunks = []
+    silent_since = time.time()
+    stalled = False
+    # Newest complete line from either stream: on a stall this is the last
+    # thing that demonstrably worked, which localises the hang to whatever
+    # the remote side attempted next.
+    last_line = None
+    seen_bytes = 0
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ, "out")
+    sel.register(proc.stderr, selectors.EVENT_READ, "err")
+    ticked = time.time()
+
+    def quiet_tick():
+        """A tick with nothing read: True once the step is abandoned."""
+        silence = time.time() - silent_since
+        if limit and silence >= limit:
+            _stall_report(label, silence, capture, last_line, seen_bytes)
+            _kill_group(proc)
+            return True
+        sys.stderr.write(
+            "nersc: waiting on %s - %ds without output (last: %s)%s\n"
+            % (label[:70], int(silence),
+               last_line[:70] if last_line else "nothing yet",
+               "" if limit else " (abandonment disabled)"))
+        sys.stderr.flush()
+        return False
+
+    try:
+        while sel.get_map():
+            if time.time() - ticked >= PROGRESS_TICK_SECONDS:
+                ticked = time.time()
+                _tick()
+            ready = sel.select(timeout=PROGRESS_TICK_SECONDS)
+            if ready:
+                for key, _ in ready:
+                    stream = key.fileobj
+                    data = os.read(stream.fileno(), 65536)
+                    if not data:
+                        sel.unregister(stream)
+                        continue
+                    silent_since = time.time()
+                    seen_bytes += len(data)
+                    parts = data.decode("utf-8", "replace").strip().splitlines()
+                    if parts:
+                        last_line = parts[-1]
+                    if key.data == "err" and not merge_err:
+                        # Held, not printed: on success this is only the site
+                        # login banner.  It is replayed below whenever the
+                        # step fails or stalls, so real errors are never
+                        # swallowed and successful runs stay quiet.
+                        err_chunks.append(data)
+                    elif on_output is not None:
+                        on_output(data)
+                    elif capture:
+                        chunks.append(data)
+                    else:
+                        sys.stdout.buffer.write(data)
+                        sys.stdout.buffer.flush()
+                continue
+            if proc.poll() is not None:
+                # The client has exited and this pass of select() found
+                # nothing left to read, so no further byte can arrive.  EOF
+                # alone is not a reliable end marker here: the ssh MASTER
+                # holds duplicates of the session's pipe write ends, so the
+                # pipes stay open long after the session itself has died,
+                # and waiting for EOF would wait on a dead transfer.
+                # Watching the process rather than the pipes makes this
+                # return at once.
+                break
+            if quiet_tick():
+                stalled = True
+                break
+        # Both streams have ended, but the client may not have: a command
+        # can close its output and go on running. Its exit is waited for
+        # under the same rule as silence, rather than cut off after a fixed
+        # few seconds with nothing said.
+        while not stalled and proc.poll() is None:
+            try:
+                proc.wait(timeout=PROGRESS_TICK_SECONDS)
+            except subprocess.TimeoutExpired:
+                _tick()
+                stalled = quiet_tick()
+    except BaseException:
+        # The child owns its own session, so Ctrl-C or a terminating signal
+        # reaches only this process; pass it on rather than leaving a
+        # detached transfer alive.
+        _kill_group(proc)
+        raise
+    finally:
+        sel.close()
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+    text = b"".join(chunks).decode("utf-8", "replace")
+
+    def _replay_stderr():
+        lines = [ln for ln in b"".join(err_chunks)
+                 .decode("utf-8", "replace").splitlines() if ln.strip()]
+        if any("NOTICE TO USERS" in ln for ln in lines):
+            # Drop the site login banner; it carries no diagnostic value.
+            lines = [ln for ln in lines if not ln.startswith("*")
+                     and "NOTICE TO USERS" not in ln]
+        if lines:
+            sys.stderr.write("  remote stderr: %s\n" % lines[-1][:200])
+            sys.stderr.flush()
+
+    if stalled:
+        _replay_stderr()
+        return 124, text
+    rc = proc.returncode
+    if rc != 0:
+        _replay_stderr()
+    return rc, text
+
+
+def remote_run(command_argv, tty=False, cd=None):
+    """Run argv on the NERSC login node; returns the exit code.
+
+    Non-interactive calls go through the progress guard, so a wedged remote
+    filesystem surfaces as a diagnostic instead of a silent hang.  A tty
+    session is a human at a keyboard - long silences are normal there - so it
+    runs unguarded.
+    """
+    ensure_master()
+    quoted = " ".join(shlex.quote(a) for a in command_argv)
+    if cd:
+        quoted = "cd %s && %s" % (shlex.quote(cd), quoted)
+    argv = mux_ssh(extra=(("-t",) if tty else ()), batch=not tty)
+    argv.append(quoted)
+    if tty:
+        return subprocess.run(argv).returncode
+    return _stream(argv, quoted[:160], capture=False)[0]
+
+
+def remote_out(command_argv, merge_stderr=False, cd=None):
+    """Run argv remotely and return (returncode, stdout).
+
+    On a stall the code is 124 and whatever streamed through beforehand is
+    still returned, so callers can use partial results instead of losing the
+    pass.  With merge_stderr=False stderr is held, and replayed only if the
+    command fails, rather than folded into the parsed text.
+    """
+    ensure_master()
+    quoted = " ".join(shlex.quote(a) for a in command_argv)
+    if cd:
+        quoted = "cd %s && %s" % (shlex.quote(cd), quoted)
+    argv = mux_ssh()
+    argv.append(quoted)
+    return _stream(argv, quoted[:160], capture=True, merge_err=merge_stderr)
+
+
+def remote_count(command_argv):
+    """Run argv remotely and return (returncode, lines of stdout).
+
+    For a command whose output is only a progress signal, such as ``rm -rfv``
+    over a whole run directory: every line still resets the stall guard, but
+    the lines themselves are counted, not kept or printed.
+    """
+    ensure_master()
+    quoted = " ".join(shlex.quote(a) for a in command_argv)
+    argv = mux_ssh()
+    argv.append(quoted)
+    lines = [0]
+
+    def count(data):
+        lines[0] += data.count(b"\n")
+
+    code, _ = _stream(argv, quoted[:160], capture=True, on_output=count)
+    return code, lines[0]
+
+
+# --------------------------------------------------------------------------
+# transfers (via DTN)
+# --------------------------------------------------------------------------
+
+def _tcp_ok(host, port=22, timeout=None):
+    """Whether *host* answers on *port* within dtn_probe_timeout seconds."""
+    if timeout is None:
+        timeout = max(0.1, cfg_number("dtn_probe_timeout"))
+    try:
+        with socketlib.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def pick_dtn(avoid=None):
+    """The first DTN that answers, trying the one that last did first, and
+    *avoid*, one a transfer has just lost its connection to, last; None when
+    none answers."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    cache = STATE_DIR / "dtn"
+    candidates = CFG["dtns"].split()
+    if cache.is_file():
+        cached = cache.read_text().strip()
+        if cached in candidates:
+            candidates = [cached] + [d for d in candidates if d != cached]
+    if avoid in candidates:
+        candidates = [d for d in candidates if d != avoid] + [avoid]
+    for host in candidates:
+        if _tcp_ok(host):
+            try:
+                cache.write_text(host + "\n")
+            except OSError:
+                pass
+            return host
+    return None
+
+
+def expand_remote(path):
+    """Resolve the NERSC-side conveniences a local shell cannot.
+
+    $PSCRATCH/$SCRATCH and $CFS are substituted from the config (a local shell
+    would have expanded them to nothing); a leading ~/ becomes home-relative.
+    """
+    if CFG["scratch"]:
+        path = re.sub(r"^\$P?SCRATCH(?=/|$)", CFG["scratch"], path)
+    if CFG["cfs"]:
+        path = re.sub(r"^\$CFS(?=/|$)", CFG["cfs"], path)
+    if path == "~":
+        return "."
+    if path.startswith("~/"):
+        return path[2:] or "."
+    return path
+
+
+#: rsync long options whose value may be given as the next argument.
+RSYNC_VALUE_OPTIONS = frozenset((
+    "--address", "--backup-dir", "--block-size", "--bwlimit", "--cc",
+    "--checksum-choice", "--checksum-seed", "--chmod", "--chown",
+    "--compare-dest", "--compress-choice", "--compress-level", "--contimeout",
+    "--copy-as", "--copy-dest", "--debug", "--early-input",
+    "--exclude", "--exclude-from", "--files-from", "--filter", "--groupmap",
+    "--iconv", "--include", "--include-from", "--info", "--link-dest",
+    "--log-file", "--log-file-format", "--log-format", "--max-alloc", "--max-delete",
+    "--max-size", "--min-size", "--modify-window", "--out-format", "--outbuf",
+    "--partial-dir", "--password-file", "--port", "--protocol",
+    "--remote-option", "--rsh", "--rsync-path", "--skip-compress",
+    "--sockopts", "--stop-after", "--stop-at", "--suffix", "--temp-dir",
+    "--timeout", "--usermap", "--write-batch", "--only-write-batch",
+    "--read-batch", "--zc", "--zl",
+))
+
+#: rsync short options that take a value: the rest of the cluster, or else
+#: the next argument.
+RSYNC_VALUE_LETTERS = frozenset("BMTef@")
+
+
+def _rsync_tokens(args):
+    """Classify rsync-style arguments as ("option" | "value" | "path", text).
+
+    An option's value stays with it, whether written ``--exclude=PAT``,
+    ``--exclude PAT``, ``-fPAT`` or ``-f PAT``, so a value is never taken for
+    a path.  Everything after ``--`` is a path.
+    """
+    args = list(args)
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "--":
+            for rest in args[index:]:
+                yield "path", rest
+            return
+        if arg.startswith("--"):
+            yield "option", arg
+            if "=" not in arg and arg in RSYNC_VALUE_OPTIONS and index < len(args):
+                yield "value", args[index]
+                index += 1
+        elif arg.startswith("-") and arg != "-":
+            yield "option", arg
+            for position in range(1, len(arg)):
+                if arg[position] in RSYNC_VALUE_LETTERS:
+                    if position == len(arg) - 1 and index < len(args):
+                        yield "value", args[index]
+                        index += 1
+                    break
+        else:
+            yield "path", arg
+
+
+def split_rsync_args(args):
+    """(options with their values, paths) from an rsync-style argument list."""
+    options, paths = [], []
+    for kind, text in _rsync_tokens(args):
+        (paths if kind == "path" else options).append(text)
+    return options, paths
+
+
+def rsync_dry_run(args):
+    """Whether rsync-style *args* ask for a dry run (``--dry-run`` or ``-n``,
+    alone or in a cluster such as ``-avn``)."""
+    for kind, text in _rsync_tokens(args):
+        if kind != "option":
+            continue
+        if text == "--dry-run":
+            return True
+        if not text.startswith("--"):
+            for letter in text[1:]:
+                if letter == "n":
+                    return True
+                if letter in RSYNC_VALUE_LETTERS:
+                    break
+    return False
+
+
+#: rsync's statuses for a transfer its connection cut short: 10 socket I/O,
+#: 12 protocol stream, 255 ssh.  Its inactivity timeout (30, 35) is not one:
+#: that is NERSC storage gone quiet, which is reported rather than retried.
+RSYNC_CONNECTION_LOST = (10, 12, 255)
+
+#: Where a transfer that may be resumed keeps a file its connection cut
+#: short, for the next run to finish rather than send again.  Relative, so
+#: it sits in the destination directory, where rsync leaves it out of the
+#: transfer and out of --delete.
+RSYNC_PARTIAL_DIR = "--partial-dir=.rsync-partial"
+
+#: rsync options that treat a file cut short their own way, which rsync
+#: will not combine with --partial-dir.
+RSYNC_OWN_PARTIALS = frozenset(("--inplace", "--append", "--append-verify",
+                                "--write-devices", "--partial-dir"))
+
+#: rsync options that name a file to read, which "-" makes standard input.
+RSYNC_FILE_OPTIONS = frozenset(("--files-from", "--exclude-from",
+                                "--include-from", "--read-batch"))
+
+#: The names under which rsync reads a file that is standard input.
+STDIN_NAMES = frozenset(("-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"))
+
+#: A filter rule that merges rules from standard input: ". -", "merge -".
+STDIN_MERGE_RULE = re.compile(r"^(dir-merge|merge|[.:])[^ _]*[ _](\S+)$")
+
+
+def rsync_partial_flags(args):
+    """--partial-dir for a transfer that may be resumed, or --partial where
+    this rsync has no --partial-dir, unless rsync-style *args* keep what is
+    cut short their own way; nothing where this rsync's help cannot be read
+    (rsync_help)."""
+    for kind, text in _rsync_tokens(args):
+        if kind == "option" and text.split("=", 1)[0] in RSYNC_OWN_PARTIALS:
+            return []
+    text = rsync_help()
+    if "--partial-dir" in text:
+        return [RSYNC_PARTIAL_DIR]
+    return ["--partial"] if "--partial" in text else []
+
+
+#: What rsync_help found, once it has looked.
+_RSYNC_HELP = []
+
+
+def rsync_help():
+    """What ``rsync --help`` prints here, or "" when it fails or says
+    anything on stderr, as openrsync may: a probe that cannot be read offers
+    nothing, so nothing is asked of that rsync that it may refuse."""
+    if not _RSYNC_HELP:
+        try:
+            proc = subprocess.run(["rsync", "--help"], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  universal_newlines=True, timeout=10)
+            text = proc.stdout if proc.returncode == 0 and not proc.stderr.strip() else ""
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            text = ""
+        _RSYNC_HELP.append(text or "")
+    return _RSYNC_HELP[0]
+
+
+def _rsync_option_values(args):
+    """(option, value) for each option in rsync-style *args* given a value."""
+    last = ""
+    for kind, text in _rsync_tokens(args):
+        if kind == "value":
+            yield (last if last.startswith("--") else "-" + last[-1:]), text
+        elif kind == "option":
+            last = text
+            if text.startswith("--"):
+                if "=" in text:
+                    yield tuple(text.split("=", 1))
+                continue
+            for position in range(1, len(text)):
+                if text[position] in RSYNC_VALUE_LETTERS:
+                    if position < len(text) - 1:
+                        yield "-" + text[position], text[position + 1:]
+                    break
+
+
+def rsync_reads_stdin(args):
+    """The option in rsync-style *args* that has rsync read standard input
+    (a file that is it, as in --files-from=- or --files-from=/dev/stdin, or
+    a filter rule merging from it), or None."""
+    for option, value in _rsync_option_values(args):
+        if value in STDIN_NAMES and option in RSYNC_FILE_OPTIONS:
+            return option
+        merge = STDIN_MERGE_RULE.match(value.strip())
+        if option in ("--filter", "-f") and merge and merge.group(2) in STDIN_NAMES:
+            return option
+    return None
+
+
+def rsync_shell(extra=()):
+    """rsync's remote shell: base_ssh() and *extra*, logging what ssh says to
+    this process's log (_rsync_ssh_log), where _rsync_riding reads it."""
+    return " ".join(shlex.quote(p) for p in base_ssh() + list(extra) + [
+        "-E", str(_rsync_ssh_log())])
+
+
+def _rsync_ssh_log():
+    return sock_dir() / ("rsync-ssh-%d.log" % os.getpid())
+
+
+def _sweep_rsync_ssh_logs():
+    """Remove the ssh logs of transfers whose process is gone: one killed
+    outright (SIGKILL) leaves its log behind."""
+    for path in sock_dir().glob("rsync-ssh-*.log"):
+        try:
+            pid = int(path.name[len("rsync-ssh-"):-len(".log")])
+        except ValueError:
+            continue
+        if pid == os.getpid() or _pid_alive(pid):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _log_lines(log, start):
+    """The lines *log* has gained past byte *start*."""
+    try:
+        with log.open() as handle:
+            handle.seek(start)
+            return [line.rstrip() for line in handle.read().splitlines()
+                    if line.strip()]
+    except OSError:
+        return []
+
+
+def _log_size(log):
+    try:
+        return log.stat().st_size
+    except OSError:
+        return 0
+
+
+def _rsync_riding(build, what, args=()):
+    """Run the rsync argv *build*() makes, and again when its connection is
+    lost.
+
+    Each run is built afresh, so a DTN that went away is replaced by one
+    that answers, and a certificate that expired meanwhile stops it.  A file
+    that arrived whole is not sent again, and one cut short is finished
+    (RSYNC_PARTIAL_DIR).  The time a cut-short run spent counts in its
+    favour (connection_failed), so drops over a long transfer never add up,
+    while a connection that will not stay up ends it.  What ssh said is
+    passed on as it is, and a run that NERSC refused, or that read standard
+    input (*args* are the caller's rsync options), is not run again: the
+    one would be refused again, and the other would find its input gone.
+    *what* names the transfer.
+    """
+    log = _rsync_ssh_log()
+    _sweep_rsync_ssh_logs()
+    try:
+        while True:
+            argv = build()
+            start = _log_size(log)
+            started = time.time()
+            code = _run_child(argv)
+            said = _log_lines(log, start)
+            for line in said:
+                sys.stderr.write(line + "\n")
+            if code not in RSYNC_CONNECTION_LOST:
+                return code
+            refused = [line for line in said if SSH_REFUSAL.search(line)]
+            if refused:
+                sys.stderr.write(
+                    "nersc: %s: NERSC refused the connection: %s\n"
+                    "  certificate: %s\n"
+                    "  not resumed, since trying again would only be refused "
+                    "again; %s\n" % (what, refused[0], describe_cert(),
+                                     CFG["refresh_hint"]))
+                return code
+            reader = rsync_reads_stdin(args)
+            if reader:
+                sys.stderr.write(
+                    "nersc: %s: rsync lost its connection (exit %d); not "
+                    "resumed, since its %s was standard input, which a second "
+                    "run would find empty\n" % (what, code, reader))
+                return code
+            memory = connection_failed(time.time() - started)
+            if memory.exhausted:
+                sys.stderr.write("nersc: %s: rsync lost its connection %d times "
+                                 "in quick succession; connect_retries (%d) is "
+                                 "how many are resumed\n"
+                                 % (what, memory.fresh, memory.limit))
+                return code
+            wait = memory.wait()
+            sys.stderr.write("nersc: %s: rsync lost its connection (exit %d); "
+                             "resuming in %ds, and what arrived whole is not "
+                             "sent again\n" % (what, code, wait))
+            _pause(wait)
+    finally:
+        try:
+            log.unlink()
+        except OSError:
+            pass
+
+
+def rsync_transfer(args, up):
+    flags, paths = split_rsync_args(args)
+    if len(paths) != 2:
+        die("need exactly a source and a destination",
+            "usage: nersc %s [RSYNC_FLAGS] SRC DEST" % ("push" if up else "pull"),
+            "remote paths are relative to the NERSC home; $PSCRATCH and $CFS are understood")
+    src, dest = paths
+    # The DTN the last run went to, which a run after it (one resuming a lost
+    # connection) tries last.  Passed only when there is one, so that a
+    # project's stand-in for pick_dtn taking no argument keeps working.
+    used = {"dtn": None}
+
+    def build():
+        require_cert()
+        ensure_known_hosts()
+        dtn = used["dtn"] = pick_dtn(used["dtn"]) if used["dtn"] else pick_dtn()
+        remote_shell = rsync_shell()
+        if dtn is None:
+            # No DTN reachable: ride the login master the way mux_ssh() does,
+            # with the credentials too, so that a master gone since, or out of
+            # sessions, means a direct connection rather than a refusal.  rsync
+            # adds the host itself.
+            ensure_master()
+            remote_shell = rsync_shell([
+                "-o", "ControlPath=%s" % sock_path(), "-o", "ControlMaster=auto"])
+            host = CFG["pool"]
+            sys.stderr.write("nersc: no DTN reachable; transferring over the "
+                             "login connection\n")
+        else:
+            host = dtn
+        remote_prefix = "%s@%s:" % (CFG["user"], host)
+        if up:
+            pair = [src, remote_prefix + expand_remote(dest)]
+        else:
+            pair = [remote_prefix + expand_remote(src), dest]
+        return (["rsync", "-a", rsync_stall_flag()] + rsync_partial_flags(flags)
+                + ["-e", remote_shell] + flags + pair)
+
+    return _rsync_riding(build, "push" if up else "pull", flags)
+
+
+#: How often a sync waiting for another one says what it is waiting for.
+SYNC_WAIT_NOTE_SECONDS = 60
+
+
+def _sync_lock():
+    """Serialise concurrent mirror syncs on this node (several agents can
+    `nersc submit` at once; two --delete rsyncs over one dest trip on each
+    other).  Returns the open lock file; closing it lets go.
+
+    An flock on a node-local file, which the kernel releases when its
+    holder exits, however it exits: a held lock is always a live sync, so
+    this waits for as long as that sync runs, naming it now and then, and
+    never breaks the lock of one that is merely slow.  The sync it waits
+    for is itself bounded by rsync's inactivity timeout.  A holder that is
+    stopped (Ctrl-Z) does nothing until it is resumed, so after
+    lock_patience seconds of that the wait ends, naming it.
+    """
+    path = sock_dir() / "sync.lock"
+    try:
+        handle = open(str(path), "a+")
+    except OSError as exc:
+        die("cannot create sync lock %s: %s" % (path, exc))
+    try:
+        started, noted, stopped_since = time.time(), None, None
+        patience = cfg_number("lock_patience")
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                    die("cannot take sync lock %s: %s" % (path, exc))
+            handle.seek(0)
+            holder = handle.read().strip()
+            if holder.isdigit() and pid_stopped(int(holder)):
+                stopped_since = stopped_since or time.time()
+                if time.time() - stopped_since >= patience:
+                    die("another mirror sync on this node (pid %s) holds the "
+                        "sync lock and has been stopped for %ds"
+                        % (holder, int(time.time() - stopped_since)),
+                        "resume it with fg, or end it",
+                        "lock_patience (%d) in %s is how long a stopped "
+                        "holder is waited for" % (patience, CONFIG_PATH))
+            else:
+                stopped_since = None
+            if noted is None or time.time() - noted >= SYNC_WAIT_NOTE_SECONDS:
+                noted = time.time()
+                sys.stderr.write(
+                    "nersc: waiting for another mirror sync on this node%s "
+                    "to finish (%ds so far)\n"
+                    % (" (pid %s)" % holder if holder.isdigit() else "",
+                       int(noted - started)))
+                sys.stderr.flush()
+            time.sleep(1)
+        handle.seek(0)
+        handle.truncate()
+        handle.write("%d\n" % os.getpid())
+        handle.flush()
+        return handle
+    except BaseException:
+        handle.close()
+        raise
+
+
+def pid_stopped(pid):
+    """Whether process *pid* on this node is stopped (Ctrl-Z, SIGSTOP)."""
+    try:
+        with open("/proc/%d/stat" % pid) as handle:
+            return handle.read().rsplit(")", 1)[1].split()[0] in ("T", "t")
+    except (OSError, IndexError):
+        pass
+    if os.path.isdir("/proc/self"):
+        return False
+    try:
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               universal_newlines=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return state.strip()[:1] in ("T", "t")
+
+
+def require_mirror():
+    """(local source dir with trailing /, remote dest) or die naming the fix."""
+    src = mirror_src()
+    dest = expand_remote((CFG.get("mirror_dest") or "").strip()).rstrip("/")
+    if not src or not dest or dest == ".":
+        die("no code mirror is configured",
+            "set `mirror_src = LOCAL_DIR` and `mirror_dest = NERSC_HOME_RELATIVE_DIR` "
+            "in %s" % CONFIG_PATH,
+            "or run a command without syncing: nersc submit --no-sync -- CMD ...")
+    return src.rstrip("/") + "/", dest
+
+
+def cmd_sync(args):
+    src, dest = require_mirror()
+    if not os.path.isdir(src):
+        die("mirror source %s does not exist" % src)
+
+    # The DTN the last run went to, which a run resuming it tries last.
+    used = {"dtn": None}
+
+    def build():
+        require_cert()
+        ensure_known_hosts()
+        dtn = used["dtn"] = pick_dtn(used["dtn"]) if used["dtn"] else pick_dtn()
+        if dtn is None:
+            die("no NERSC DTN reachable for the code mirror",
+                "tried: %s" % CFG["dtns"])
+        argv = (["rsync", "-a", "--delete", rsync_stall_flag()]
+                + rsync_partial_flags(args) + ["-e", rsync_shell()])
+        if EXCLUDE_PATH.is_file():
+            argv.append("--exclude-from=%s" % EXCLUDE_PATH)
+        argv += list(args)
+        return argv + [src, "%s@%s:%s/" % (CFG["user"], dtn, dest)]
+
+    # Built once before the lock, so a mirror with no DTN to go to is said
+    # without waiting for another sync; built again for each run after that.
+    built = [build()]
+    started = time.time()
+    lock = _sync_lock()
+    try:
+        code = _rsync_riding(lambda: built.pop() if built else build(), "sync", args)
+    finally:
+        lock.close()
+    if code in (0, 24):  # 24 = source files vanished mid-run; fine for a live tree
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if not rsync_dry_run(args):
+            (STATE_DIR / "last-sync").write_text("%d\n" % int(time.time()))
+        sys.stderr.write("nersc: mirror synced in %ds\n" % int(time.time() - started))
+        return 0
+    return code
+
+
+def _submit_input_candidate(value):
+    """The existing local path *value* names, resolved, or None.
+
+    *value* is a path, or an argv-shaped item: ``--flag=PATH`` names PATH, a
+    bare ``--flag`` names nothing, and a sequence stands for its first item.
+    A relative path is relative to the code mirror.
+    """
+    if isinstance(value, (tuple, list)):
+        if not value:
+            return None
+        value = value[0]
+    if not isinstance(value, (str, os.PathLike)):
+        return None
+    raw = str(value).strip()
+    if not raw or "\x00" in raw or "\n" in raw:
+        return None
+    if raw.startswith("-"):
+        if "=" not in raw:
+            return None
+        raw = raw.split("=", 1)[1]
+    if not raw:
+        return None
+    candidate = Path(os.path.expanduser(raw))
+    if not candidate.is_absolute():
+        if not mirror_src():
+            return None
+        candidate = Path(mirror_src()) / candidate
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    return resolved if resolved.exists() else None
+
+
+def _submit_input_inventory(arguments, discovered=()):
+    """Classify submit inputs below the return root or the code mirror.
+
+    *arguments* are argv-shaped items and *discovered* are the paths the
+    hooks file's submit_inputs returned; see _submit_input_candidate.  Each
+    row is ``(root_relative_path, absolute_source, is_directory, root_kind)``,
+    where root_kind is "scratch" (under return_root) or "mirror".  Paths
+    outside both roots are dropped, and a directory is dropped when a file
+    inside it is listed too: the file is what the job needs.  Inputs are
+    exactly these paths; nothing is inferred from file contents.
+    """
+    roots = tuple(
+        (kind, Path(local).resolve())
+        for kind, local in (("scratch", return_root()), ("mirror", mirror_src()))
+        if local
+    )
+    rows = {}
+    for value in list(arguments or ()) + list(discovered or ()):
+        candidate = _submit_input_candidate(value)
+        if candidate is None:
+            continue
+        for kind, root in roots:
+            try:
+                relative = candidate.relative_to(root)
+            except ValueError:
+                continue
+            if str(relative) in ("", "."):
+                break
+            key = (kind, relative.as_posix())
+            rows[key] = (
+                relative.as_posix(),
+                str(candidate),
+                candidate.is_dir(),
+                kind,
+            )
+            break
+    inventory = [rows[key] for key in sorted(rows)]
+    exact_files = [row for row in inventory if not row[2]]
+    pruned = []
+    redundant_directories = []
+    for row in inventory:
+        if not row[2]:
+            pruned.append(row)
+            continue
+        directory = Path(row[0])
+        redundant = False
+        for exact in exact_files:
+            if exact[3] != row[3]:
+                continue
+            try:
+                Path(exact[0]).relative_to(directory)
+            except ValueError:
+                continue
+            redundant = True
+            break
+        if redundant:
+            redundant_directories.append(row)
+        else:
+            pruned.append(row)
+    if redundant_directories:
+        sys.stderr.write(
+            "nersc: ignored %d redundant input director%s: the listed files "
+            "inside are staged on their own\n"
+            % (
+                len(redundant_directories),
+                "y" if len(redundant_directories) == 1 else "ies",
+            )
+        )
+    return pruned
+
+
+def _sync_submit_inputs(rows):
+    """Copy every inventoried input to the same place under its NERSC root.
+
+    Nothing is deleted on NERSC: inputs are merged into what is there.
+    """
+    if not rows:
+        return 0
+    require_cert()
+    ensure_known_hosts()
+    dtn = pick_dtn()
+    if dtn is None:
+        die(
+            "no NERSC DTN reachable for submit-input staging",
+            "tried: %s" % CFG["dtns"],
+        )
+    remote_shell = " ".join(shlex.quote(part) for part in base_ssh())
+    local_roots = {
+        kind: Path(local).resolve() if local else None
+        for kind, local in (("scratch", return_root()), ("mirror", mirror_src()))
+    }
+    remote_roots = {
+        "scratch": expand_remote(CFG["scratch"]).rstrip("/"),
+        "mirror": expand_remote(CFG.get("mirror_dest") or "").rstrip("/"),
+    }
+    exact_files = [row for row in rows if not row[2]]
+    exact_bytes = 0
+    for _relative, source, _is_directory, _kind in exact_files:
+        try:
+            exact_bytes += os.stat(source).st_size
+        except OSError as exc:
+            die("cannot stat submit input %s (%s)" % (source, exc))
+    for kind in ("scratch", "mirror"):
+        if not remote_roots[kind]:
+            if any(row[3] == kind for row in rows):
+                die(
+                    "no NERSC destination root configured for %s inputs"
+                    % kind
+                )
+            continue
+        for is_directory in (False, True):
+            selected = [
+                row
+                for row in rows
+                if row[3] == kind and bool(row[2]) == is_directory
+            ]
+            if not selected:
+                continue
+            sources = []
+            for relative, _source, _is_directory, _kind in selected:
+                marked = str(local_roots[kind]) + "/./" + relative
+                if is_directory:
+                    marked = marked.rstrip("/") + "/"
+                sources.append(marked)
+            argv = ["rsync", "-a", "-R", rsync_stall_flag(), "-e", remote_shell]
+            if is_directory:
+                for pattern in SUBMIT_INPUT_EXCLUDES:
+                    argv.append("--exclude=%s" % pattern)
+            argv += sources
+            argv.append(
+                "%s@%s:%s/" % (CFG["user"], dtn, remote_roots[kind])
+            )
+            code = _run_child(argv)
+            if code not in (0, 24):
+                return code
+    directory_count = sum(1 for row in rows if row[2])
+    detail = ""
+    if directory_count:
+        detail = " and %d input director%s" % (
+            directory_count, "y" if directory_count == 1 else "ies")
+    sys.stderr.write(
+        "nersc: staged %d exact file input(s), %d source byte(s)%s\n"
+        % (len(exact_files), exact_bytes, detail)
+    )
+    return 0
+
+
+def _hooks_broken_for(what):
+    """Refuse *what* when a hooks file is configured but did not load: the
+    project's rewrite of the command is unknown, so running anything would be
+    guessing."""
+    if HOOKS_ERROR:
+        die("the hooks file %s did not load, so %s cannot run" % (CFG.get("hooks"), what),
+            HOOKS_ERROR,
+            "fix the file, or bypass the project's default form: "
+            "nersc submit [--no-sync] -- CMD ...")
+
+
+def _discover_default_submit_inputs(command):
+    """Local paths the rewritten submit command needs on NERSC (hook)."""
+    hook = _hook("submit_inputs")
+    if hook is None:
+        return []
+    return [str(path) for path in (hook(list(command), TOOL) or [])]
+
+
+def _default_submit_argv(args):
+    """The project's default `nersc submit ARGS` form, or None (verbatim).
+
+    Defined by the hooks file's ``submit_argv``; without one there is no
+    default form and ARGS run as given.
+    """
+    _hooks_broken_for("the default `nersc submit` form")
+    hook = _hook("submit_argv")
+    if hook is None:
+        return None
+    argv = hook(list(args), TOOL)
+    return None if argv is None else [str(part) for part in argv]
+
+
+def cmd_submit(args):
+    # Tool flags are LEADING only, so a command's own --no-sync/--cd after
+    # the `--` (or after the submitter path) is never eaten.
+    args = list(args)
+    no_sync = False
+    cd = expand_remote((CFG.get("mirror_dest") or "").strip()) or None
+    cd_given = False
+    while args:
+        if args[0] == "--no-sync":
+            no_sync = True
+            args.pop(0)
+        elif args[0] == "--cd":
+            if len(args) < 2:
+                die("--cd needs a directory")
+            cd = expand_remote(args[1])
+            cd_given = True
+            args = args[2:]
+        else:
+            break
+    explicit = args[:1] == ["--"]
+    if explicit:
+        args = args[1:]
+    if not args:
+        die("nothing to run",
+            "usage: nersc submit [--no-sync] [--cd DIR] -- CMD ...",
+            "       nersc submit ARGS   (the project's default form, from its hooks file)")
+    default_submit = False
+    if not explicit:
+        default = _default_submit_argv(args)
+        if default is not None:
+            if cd_given:
+                # The injected launcher and submitter paths are relative to
+                # the mirror root; running them from elsewhere would fail
+                # remotely AFTER a sync. Refuse here instead.
+                die("--cd belongs to the explicit form: "
+                    "nersc submit --cd DIR -- CMD ...",
+                    "the default submitter form always runs from the mirror "
+                    "root")
+            args = default
+            default_submit = True
+    if not no_sync:
+        require_mirror()
+        discovered = (
+            _discover_default_submit_inputs(args) if default_submit else []
+        )
+        inputs = _submit_input_inventory([], discovered=discovered)
+        code = cmd_sync([])
+        if code != 0:
+            die("mirror sync failed (rc=%d); not submitting" % code,
+                "run with --no-sync to submit against the existing mirror")
+        code = _sync_submit_inputs(inputs)
+        if code != 0:
+            die(
+                "submit-input staging failed (rc=%d); not submitting" % code,
+                "the code mirror synced, but the job's inputs did not all "
+                "reach NERSC",
+            )
+    return remote_run(args, cd=cd)
+
+
+# --------------------------------------------------------------------------
+# automatic job return (track -> reap)
+#
+# NERSC scratch is treated as ephemeral: a tracked job's run dir is pulled
+# back to this cluster as soon as the job reaches a terminal state, so analysis
+# only ever looks at the local copy under return_root. The registry is one
+# JSON file per job in <scratch>/.nersc-return/queue/ ON NERSC — written by
+# `sbatch --return`, `track`, or directly by code running there (it is just a
+# local file write on that side). `reap` runs here (periodically, from cron or
+# a watcher job), is idempotent, and moves the JSON to done/ once the run dir
+# has landed.
+# --------------------------------------------------------------------------
+
+JOB_ID_RE = re.compile(r"^[0-9]+(_[0-9]+)?$")
+
+#: sacct states after which a job will produce no further output on its own.
+#: A REQUEUED/PENDING resurrection (a job that requeues itself on timeout) shows a
+#: non-terminal state again, which is why reap re-reads sacct on every pass
+#: and why a job must look terminal on two consecutive passes before cleanup.
+TERMINAL_STATES = ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT",
+                   "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL",
+                   "DEADLINE")
+
+
+def is_terminal(state):
+    return state.startswith(TERMINAL_STATES)
+
+
+def return_queue_dir():
+    configured = CFG.get("return_queue", "")
+    if configured:
+        return expand_remote(configured)
+    if not CFG["scratch"]:
+        die("no `scratch` configured; cannot locate the return queue")
+    return CFG["scratch"].rstrip("/") + "/.nersc-return"
+
+
+def default_dest(src):
+    """Map a NERSC run dir to its home on this cluster by path parity.
+
+    <scratch>/X -- and <scratch_link>/X, when a home-relative symlink to
+    scratch is configured -- both mean the relative path X, which lands at
+    <return_root>/X. Anything not under scratch, or any path at all when no
+    return_root is configured, has no default and needs an explicit DEST.
+    """
+    root = return_root()
+    if not root:
+        return None
+    scratch = CFG["scratch"].rstrip("/")
+    link = (CFG.get("scratch_link") or "").strip().strip("/")
+    rel = None
+    if scratch and (src == scratch or src.startswith(scratch + "/")):
+        rel = src[len(scratch):].lstrip("/")
+    elif link and src.startswith(link + "/"):
+        rel = src[len(link) + 1:]
+    if not rel:
+        return None
+    return os.path.join(root, rel)
+
+
+def _no_default_dest_hints():
+    if not return_root():
+        return ("no `return_root` is configured in %s, so returns have no "
+                "default destination;" % CONFIG_PATH, "pass an explicit DEST")
+    return ("only paths under $PSCRATCH%s map automatically;"
+            % (" (or ~/%s)" % CFG["scratch_link"].strip("/")
+               if (CFG.get("scratch_link") or "").strip() else ""),
+            "pass an explicit DEST")
+
+
+def cleanup_problem(src):
+    """Why run dir *src* may not be deleted from NERSC after its return, or
+    None when it may.
+
+    Cleanup deletes a whole tree, so *src* must be an absolute path with no
+    ".." component that still names something strictly inside the
+    configured scratch once normalised: ``$PSCRATCH/`` and ``$PSCRATCH/.``
+    are scratch itself and are refused.  Registration (``--cleanup``) and
+    ``reap``, right before it deletes, both apply this one rule: a queue
+    entry written directly by code on NERSC never went through
+    registration.  The check is lexical and resolves no symlinks: ``rm``
+    removes a run dir that is a symlink as just the link, but follows a
+    symlinked directory above it.
+    """
+    scratch = (CFG.get("scratch") or "").strip()
+    if not scratch:
+        return "no `scratch` is configured"
+    scratch = os.path.normpath(scratch)
+    if not os.path.isabs(scratch) or scratch == "/":
+        return "`scratch = %s` is not an absolute directory below /" % scratch
+    if not isinstance(src, str) or not os.path.isabs(src):
+        return "%r is not an absolute path" % (src,)
+    if ".." in src.split("/"):
+        return "%s has a '..' component" % src
+    if not os.path.normpath(src).startswith(scratch + "/"):
+        return "%s is not inside scratch (%s)" % (src, scratch)
+    return None
+
+
+def register_return(job, src, dest=None, cleanup=False):
+    if not JOB_ID_RE.match(job):
+        die("'%s' does not look like a Slurm job id" % job)
+    src = expand_remote(src)
+    dest = os.path.expanduser(dest) if dest else default_dest(src)
+    if not dest:
+        die("no default destination for %s" % src, *_no_default_dest_hints())
+    if cleanup:
+        problem = cleanup_problem(src)
+        if problem:
+            die("--cleanup is only allowed for run dirs under $PSCRATCH",
+                problem, "(it removes the source after the pull)")
+    record = json.dumps({"job": job, "src": src, "dest": dest,
+                         "cleanup": bool(cleanup), "tracked_at": int(time.time())})
+    rq = return_queue_dir()
+    code = remote_run(["bash", "-c",
+                       "mkdir -p %s/queue %s/done && printf '%%s\\n' %s > %s/queue/%s.json"
+                       % (shlex.quote(rq), shlex.quote(rq), shlex.quote(record),
+                          shlex.quote(rq), job)])
+    if code != 0:
+        die("could not register job %s in the return queue" % job)
+    sys.stderr.write("nersc: tracking %s — %s will return to %s%s\n"
+                     % (job, src, dest, " (and be cleaned off scratch)" if cleanup else ""))
+    return 0
+
+
+def extract_return_flags(args):
+    """Split `sbatch --return [--cleanup] [--run-dir D] [--dest D]` from real
+    sbatch args. Any of the four activates tracking; the run dir defaults to
+    sbatch's own --chdir. Returns (sbatch_args, None | dict)."""
+    passthrough, wanted, cleanup, run_dir, dest, chdir = [], False, False, None, None, None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--return":
+            wanted = True
+        elif arg == "--cleanup":
+            wanted = cleanup = True
+        elif arg == "--run-dir" or arg.startswith("--run-dir="):
+            wanted = True
+            if "=" in arg:
+                run_dir = arg.split("=", 1)[1]
+            else:
+                i += 1
+                run_dir = args[i] if i < len(args) else None
+        elif arg == "--dest" or arg.startswith("--dest="):
+            wanted = True
+            if "=" in arg:
+                dest = arg.split("=", 1)[1]
+            else:
+                i += 1
+                dest = args[i] if i < len(args) else None
+        else:
+            if arg.startswith("--chdir="):
+                chdir = arg.split("=", 1)[1]
+            elif arg in ("--chdir", "-D") and i + 1 < len(args):
+                chdir = args[i + 1]
+            passthrough.append(arg)
+        i += 1
+    if not wanted:
+        return passthrough, None
+    run_dir = run_dir or chdir
+    if not run_dir:
+        die("--return needs a run dir",
+            "give sbatch --chdir=DIR, or pass --run-dir DIR")
+    return passthrough, {"run_dir": run_dir, "dest": dest, "cleanup": cleanup}
+
+
+def cmd_sbatch(rest):
+    passthrough, tracking = extract_return_flags(rest)
+    if tracking is None:
+        return remote_run(["sbatch"] + passthrough)
+    code, out = remote_out(["sbatch"] + passthrough, merge_stderr=True)
+    sys.stdout.write(out)
+    if code != 0:
+        return code
+    match = re.search(r"Submitted batch job (\d+)", out)
+    if not match:
+        die("sbatch succeeded but no job id was found in its output; not tracking")
+    return register_return(match.group(1), tracking["run_dir"],
+                           dest=tracking["dest"], cleanup=tracking["cleanup"])
+
+
+def cmd_track(rest):
+    rest = list(rest)
+    cleanup = "--cleanup" in rest
+    if cleanup:
+        rest.remove("--cleanup")
+    if len(rest) not in (2, 3):
+        die("usage: nersc track [--cleanup] JOBID SRC_RUN_DIR [DEST]")
+    return register_return(rest[0], rest[1],
+                           dest=rest[2] if len(rest) == 3 else None, cleanup=cleanup)
+
+
+def _read_queue():
+    rq = return_queue_dir()
+    # Each file is ANNOUNCED (AT) before it is opened and echoed (OK) after it
+    # is read.  The announcement is what makes a hang locatable: if the listing
+    # goes silent, the last AT names the exact file whose read never returned,
+    # which no amount of after-the-fact inspection could recover.
+    code, out = remote_out(
+        ["bash", "-c",
+         'cd %s/queue 2>/dev/null || exit 0; '
+         'for f in *.json; do [ -e "$f" ] || exit 0; '
+         'printf "AT\\t%%s\\n" "$f"; '
+         'printf "OK\\t%%s\\t" "$f"; tr -d "\\n" < "$f"; echo; done'
+         % shlex.quote(rq)])
+    entries = []
+    announced = []
+    for line in out.splitlines():
+        if line.startswith("AT\t"):
+            announced.append(line[3:])
+            continue
+        if not line.startswith("OK\t"):
+            continue
+        rest = line[3:]
+        fname, _, payload = rest.partition("\t")
+        try:
+            record = json.loads(payload)
+        except ValueError:
+            sys.stderr.write("nersc: skipping malformed queue entry %s\n" % fname)
+            continue
+        if isinstance(record, dict) and isinstance(record.get("job"), int):
+            record["job"] = str(record["job"])
+        if not (isinstance(record, dict) and all(
+                isinstance(record.get(key), str) and record[key]
+                for key in ("job", "src", "dest"))):
+            sys.stderr.write("nersc: skipping malformed queue entry %s (job, src "
+                             "and dest must be non-empty strings)\n" % fname)
+            continue
+        record["_file"] = fname
+        entries.append(record)
+    if code != 0:
+        # Never silent, and never fatal: the listing is its own progress
+        # signal, so whatever streamed through is still actionable and the
+        # pass continues with it.  The pass is idempotent, so anything missed
+        # simply returns next time.
+        read_names = set(r["_file"] for r in entries)
+        stuck = [name for name in announced if name not in read_names]
+        sys.stderr.write(
+            "nersc: the return-queue listing stopped early (rc=%d).\n"
+            "  read    : %d entr%s\n"
+            "  stuck on: %s\n"
+            "  effect  : continuing with what was read; the rest return on a\n"
+            "            later pass once that file is readable again.\n"
+            % (code, len(entries), "y" if len(entries) == 1 else "ies",
+               stuck[0] if stuck else
+               "unknown (it stopped between files)"))
+        sys.stderr.flush()
+    return entries
+
+
+#: How many job ids to put in one ``sacct -j`` query; see ``_job_states``.
+SACCT_BATCH = 50
+
+#: How far back ``sacct`` is asked to look; see ``_job_states``.
+SACCT_START = "now-90days"
+
+
+def _expand_array_spec(jid):
+    """Concrete job ids for one sacct ``JobID`` field.
+
+    sacct collapses the elements of an array that never started into a single
+    bracketed row under the parent id -- ``1234_[1-4%2]``, ``1234_[2]``,
+    ``123_[1,3,7-9]`` -- and returns nothing at all for a query naming one of
+    those elements directly.  Expanding the bracket is what lets such a row be
+    matched against the element ids the return queue actually tracks.  Any
+    other id is returned unchanged.
+    """
+    head, sep, spec = jid.partition("_[")
+    if not sep or not spec.endswith("]"):
+        return [jid]
+    spec = spec[:-1].split("%")[0]          # drop a "%2" concurrency throttle
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            low, _, high = part.partition("-")
+            try:
+                low, high = int(low), int(high)
+            except ValueError:
+                continue
+            if high < low or high - low > 100000:
+                continue
+            out.extend("%s_%d" % (head, index) for index in range(low, high + 1))
+        else:
+            out.append("%s_%s" % (head, part))
+    return out or [jid]
+
+
+def _job_states(job_ids, strict=True):
+    """{base or array job id: aggregated sacct state}. An array parent is
+    terminal only when every element is.
+
+    Three sacct behaviours make the naive form of this query lie rather than
+    fail, and each one costs us returns:
+
+    - A never-started array element is not reported under its own id at all.
+      sacct answers only under the parent, as one collapsed bracket row, so a
+      query naming the element comes back empty -- which reads as ``UNKNOWN``,
+      which is not terminal, so the entry is skipped on every pass and stays
+      in the queue forever.  Parents are therefore queried alongside elements
+      and bracket rows are expanded (``_expand_array_spec``).
+    - Slurm truncates a very long ``-j`` list: one query for 200 tracked ids
+      returned 17 rows.  So ids are asked for in batches.
+    - sacct applies a default start time of midnight today when it is not
+      given ``-S``.  An explicit ``-j`` appears to bypass that on this system,
+      but the window is passed anyway so the answer does not depend on that
+      detail holding.
+
+    A job still absent from the answer is genuinely not in the accounting
+    database.  It stays out of the result, and the caller must not read that
+    as a terminal state or clean its source off scratch.
+    """
+    job_ids = list(job_ids)
+    tracked = set(job_ids)
+    query_ids = []
+    seen_query = set()
+    for jid in job_ids:
+        for candidate in (jid, jid.split("_")[0]):
+            if candidate not in seen_query:
+                seen_query.add(candidate)
+                query_ids.append(candidate)
+    per_job = {}
+    for start in range(0, len(query_ids), SACCT_BATCH):
+        batch = query_ids[start:start + SACCT_BATCH]
+        code, out = remote_out(
+            ["sacct", "-X", "-n", "-P", "-S", SACCT_START,
+             "-j", ",".join(batch), "--format=JobID,State"])
+        if code != 0:
+            if strict:
+                die("sacct failed (rc=%d)" % code)
+            return {}
+        for line in out.splitlines():
+            if "|" not in line:
+                continue
+            jid, _, state = line.partition("|")
+            for key in _expand_array_spec(jid.strip()):
+                if key in tracked:
+                    per_job.setdefault(key, []).append(state.strip())
+                    continue
+                # An element nobody tracks counts only toward a parent that IS
+                # tracked, which is what makes a parent terminal solely once
+                # every one of its elements is.  Otherwise drop it: asking
+                # about parents drags siblings in with them, and inventing an
+                # entry for a job the caller never asked about is noise.
+                base = key.split("_")[0]
+                if base in tracked:
+                    per_job.setdefault(base, []).append(state.strip())
+    states = {}
+    for job, seen in per_job.items():
+        bad = [s for s in seen if not is_terminal(s)]
+        states[job] = bad[0] if bad else next(
+            (s for s in seen if not s.startswith("COMPLETED")), seen[0])
+    return states
+
+
+def _seen_path():
+    return STATE_DIR / "reap-seen.json"
+
+
+def _load_seen():
+    try:
+        return json.loads(_seen_path().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_seen(seen):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _seen_path().with_name(".reap-seen.tmp")
+    tmp.write_text(json.dumps(seen))
+    os.rename(str(tmp), str(_seen_path()))
+
+
+#: The least reap_lock_stale_seconds is taken to be: twenty ticks, and a
+#: minute of NFS attribute caching several times over.  Below it, a live
+#: pass would lose its lock to the next one.
+REAP_LOCK_STALE_FLOOR = 300
+
+
+def reap_lock_stale_seconds():
+    """reap_lock_stale_seconds, and at least REAP_LOCK_STALE_FLOOR, saying
+    so once when the configured value is less."""
+    value = cfg_number("reap_lock_stale_seconds")
+    if value >= REAP_LOCK_STALE_FLOOR:
+        return value
+    if "reap_lock_stale_seconds<" not in _REPORTED:
+        _REPORTED.add("reap_lock_stale_seconds<")
+        sys.stderr.write("nersc: reap_lock_stale_seconds = %g in %s is less than "
+                         "%d, below which a live pass would lose its lock; "
+                         "using %d\n" % (value, CONFIG_PATH, REAP_LOCK_STALE_FLOOR,
+                                          REAP_LOCK_STALE_FLOOR))
+    return float(REAP_LOCK_STALE_FLOOR)
+
+
+def _reap_lock():
+    """The reap lock directory, or None when another pass holds it.
+
+    mkdir-based, because fcntl locks are unreliable on an NFS home.  A pass
+    touches its lock after each entry and on every tick of a long wait
+    (_touch_lock, through ON_TICK), so a lock untouched for
+    reap_lock_stale_seconds (900 by default, and never less than
+    REAP_LOCK_STALE_FLOOR: many missed touches, with room for NFS attribute
+    caching and for clock skew between this node and the file server)
+    belongs to a pass that died, and is broken rather than honoured.  Breaking it narrows the race with another pass
+    doing the same: the stale directory is first renamed to a name no other
+    process uses, and removed only if what was renamed is the very
+    directory judged stale.  If another pass broke it and took a fresh lock
+    in between, that fresh lock is what got renamed, so it is put back.
+    """
+    lock = STATE_DIR / "reap.lock.d"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        lock.mkdir()
+        return lock
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        die("cannot create the reap lock %s: %s" % (lock, exc.strerror))
+    try:
+        judged = lock.stat()
+    except OSError:
+        return None
+    if time.time() - judged.st_mtime <= reap_lock_stale_seconds():
+        return None
+    aside = lock.with_name("%s.stale-%s-%d" % (
+        lock.name, socketlib.gethostname().split(".")[0], os.getpid()))
+    try:
+        os.rename(str(lock), str(aside))
+    except OSError:
+        return None
+    try:
+        moved = aside.stat()
+        if (moved.st_ino, moved.st_dev) != (judged.st_ino, judged.st_dev):
+            os.rename(str(aside), str(lock))
+            return None
+        aside.rmdir()
+    except OSError:
+        return None
+    try:
+        lock.mkdir()
+    except OSError:
+        return None
+    sys.stderr.write("nersc: broke a reap lock left %s ago by a pass that "
+                     "never finished\n" % _ago(time.time() - judged.st_mtime))
+    return lock
+
+
+def _return_selectors(record, key):
+    """Validate one optional list of run-relative rsync selectors."""
+    values = record.get(key)
+    if values is None:
+        return None
+    if not isinstance(values, list):
+        raise ValueError("%s must be a list" % key)
+    cleaned = []
+    for value in values:
+        value = str(value).replace("\\", "/")
+        if value.startswith("/"):
+            raise ValueError("unsafe %s entry %r" % (key, value))
+        value = value.strip("/")
+        parts = value.split("/") if value else []
+        if not parts or any(part in ("", ".", "..") for part in parts):
+            raise ValueError("unsafe %s entry %r" % (key, value))
+        if value not in cleaned:
+            cleaned.append(value)
+    return sorted(cleaned)
+
+
+def _rsync_literal(value):
+    """Escape rsync-filter metacharacters in a literal relative path."""
+    result = value
+    for character in ("\\", "*", "?", "[", "]"):
+        result = result.replace(character, "\\" + character)
+    return result
+
+
+#: Cached ``--exclude`` arguments from the hooks file; ``None`` = not asked yet.
+_RETURN_EXCLUDES = None
+
+
+def return_exclude_args():
+    """``--exclude`` arguments the project wants on every job return.
+
+    From the hooks file's ``return_excludes``.  A hook that fails is reported
+    and ignored: returning a run directory with too much in it is a storage
+    cost, while failing the return would strand a finished job.
+    """
+    global _RETURN_EXCLUDES
+    if _RETURN_EXCLUDES is not None:
+        return _RETURN_EXCLUDES
+    patterns = []
+    hook = _hook("return_excludes")
+    if hook is not None:
+        try:
+            patterns = list(hook(TOOL) or [])
+            if not all(isinstance(item, str) for item in patterns):
+                raise ValueError("return_excludes must return strings")
+        except Exception as error:
+            sys.stderr.write("nersc: the hooks file's return_excludes failed "
+                             "(%s); returning whole run directories\n" % error)
+            patterns = []
+    elif HOOKS_ERROR:
+        sys.stderr.write("nersc: hooks file not loaded; returning whole run "
+                         "directories\n")
+    _RETURN_EXCLUDES = ["--exclude=%s" % pattern for pattern in patterns]
+    return _RETURN_EXCLUDES
+
+
+def _return_filter_args(record):
+    """Build the rsync filters for one return.
+
+    Every return, whole-tree or point-selective, first drops what the
+    project's hooks exclude (``return_exclude_args``).  rsync obeys the first
+    filter rule a path matches, so these lead: a later ``--include`` for a
+    selective return cannot pull an excluded file back in.  A selective return
+    then names what it wants and excludes the rest; a whole-tree return
+    carries everything else.
+    """
+    args = list(return_exclude_args())
+    paths = _return_selectors(record, "include_paths")
+    prefixes = _return_selectors(record, "include_prefixes")
+    if paths is None and prefixes is None:
+        return args
+    paths = paths or []
+    prefixes = prefixes or []
+    parents = set()
+    for value in paths + prefixes:
+        parts = value.split("/")
+        for length in range(1, len(parts)):
+            parents.add("/".join(parts[:length]))
+    for parent in sorted(parents, key=lambda item: (item.count("/"), item)):
+        args.append("--include=/%s/" % _rsync_literal(parent))
+    for value in paths:
+        literal = _rsync_literal(value)
+        args.extend(
+            ("--include=/%s" % literal, "--include=/%s/***" % literal)
+        )
+    for value in prefixes:
+        literal = _rsync_literal(value)
+        args.extend(
+            (
+                "--include=/%s" % literal,
+                "--include=/%s.*" % literal,
+                "--include=/%s/***" % literal,
+                "--include=/%s.*/***" % literal,
+            )
+        )
+    args.append("--exclude=*")
+    return args
+
+
+def _pull_run_dir(record, state):
+    """Pull one registered run directory home; *state* is the job's Slurm
+    state, for the report.  False, with the reason on stderr, on failure."""
+    src = record["src"]
+    dest = os.path.expanduser(record["dest"])
+    remote_shell = " ".join(shlex.quote(p) for p in base_ssh())
+    dtn = pick_dtn()
+    host = dtn if dtn else CFG["pool"]
+    source = "%s@%s:%s/" % (CFG["user"], host, src)
+    fresh = not os.path.isdir(dest)
+    target = dest + ".nersc-part" if fresh else dest
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    command = ["rsync", "-a", "--partial", rsync_stall_flag(),
+               "--out-format=%n", "-e", remote_shell]
+    try:
+        command.extend(_return_filter_args(record))
+    except ValueError as error:
+        sys.stderr.write(
+            "nersc: invalid return selectors for %s: %s\n"
+            % (record.get("job", "?"), error)
+        )
+        return False
+    command.extend([source, target + "/"])
+    # --out-format names each file as it lands, so the transfer is its own
+    # progress signal and the last line printed is how far it got.
+    code = _run_child(command)
+    if code not in (0, 24):
+        # Report EVERY failed pull, fresh or incremental.  A silent skip
+        # would make a stalled return indistinguishable from "nothing to do".
+        stalled = code in (30, 35)  # rsync's I/O-timeout codes
+        sys.stderr.write(
+            "nersc: pull of %s (%s) FAILED (rsync rc=%d)%s\n"
+            "  source : %s\n"
+            "  dest   : %s\n"
+            "  effect : the run dir is NOT returned; the queue entry is kept\n"
+            "           and retried on the next pass (partials are resumed).\n"
+            % (record["job"], state, code,
+               " — no data moved for %ss, i.e. the far side went silent "
+               "mid-transfer" % int(no_progress_seconds()) if stalled else "",
+               source, dest))
+        sys.stderr.flush()
+        return False
+    # Nothing is added to the returned directory: it holds exactly what the
+    # job wrote.  Where it came from is recorded by the queue entry in done/.
+    if fresh:
+        try:
+            os.rename(target, dest)
+        except OSError:
+            if not os.path.isdir(dest):
+                raise
+            # A concurrent puller (manual fetch vs the reaper) landed the dir
+            # between our freshness check and this rename.  Its copy might be
+            # an older mid-run snapshot, so do NOT count this pull as done
+            # (the caller must not clean up on it) — drop our partial and let
+            # the next attempt reconcile incrementally into the existing dir.
+            shutil.rmtree(target, ignore_errors=True)
+            sys.stderr.write("nersc: %s landed concurrently; will reconcile "
+                             "incrementally on the next attempt\n" % dest)
+            return False
+    return True
+
+
+def _whole_number(text, what):
+    """int(text) for a command-line value, or die naming *what* it is for."""
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if value < 0:
+        die("%s needs a whole number, not %r" % (what, text))
+    return value
+
+
+def _retire(rq, entry):
+    """Move a queue entry to done/; True when that worked, else reported."""
+    queued = "%s/queue/%s" % (rq, entry["_file"])
+    code = remote_run(["mv", queued, "%s/done/%s" % (rq, entry["_file"])])
+    if code == 0:
+        return True
+    sys.stderr.write(
+        "nersc: %s returned to %s, but its queue entry could not be moved to "
+        "done/ (mv rc=%d)\n"
+        "  entry  : %s\n"
+        "  effect : the entry stays queued and the next pass resyncs it;\n"
+        "           nothing was removed from NERSC.\n"
+        % (entry["job"], entry["dest"], code, queued))
+    sys.stderr.flush()
+    return False
+
+
+def _clean_scratch(entry, run_dir):
+    """Delete a returned run dir from NERSC; True when that worked.
+
+    ``rm -v`` makes the delete stream a line per removed path, which is the
+    live signal the stall guard needs to tell "walking a big tree" from
+    "wedged on a dead storage target".  The lines are counted, not printed.
+    """
+    code, removed = remote_count(["rm", "-rfv", "--", run_dir])
+    if code == 0:
+        sys.stderr.write("nersc: removed %s (%d path%s)\n"
+                         % (run_dir, removed, "" if removed == 1 else "s"))
+        return True
+    sys.stderr.write(
+        "nersc: cleaning %s off scratch FAILED (rm rc=%d after %d path%s)\n"
+        "  run dir: %s\n"
+        "  effect : the return itself is complete and recorded in done/; what\n"
+        "           is left of the run dir stays on NERSC.  To remove it:\n"
+        "           nersc run rm -rf -- %s\n"
+        % (entry["job"], code, removed, "" if removed == 1 else "s",
+           run_dir, shlex.quote(run_dir)))
+    sys.stderr.flush()
+    return False
+
+
+def _touch_lock(lock):
+    """Mark the reap lock as held by a live pass (see _reap_lock)."""
+    try:
+        os.utime(str(lock), None)
+    except OSError:
+        pass
+
+
+REAP_USAGE = "usage: nersc reap [--list] [--max-seconds=N]"
+
+
+def _reap_options(args):
+    """(list_only, budget) from reap's arguments; anything else is refused.
+
+    The budget, in seconds, is when a pass stops starting pulls; 0 (the
+    default) is none.  It never cuts a pull short.  A caller with a hard
+    limit need not set one: the SIGTERM that ends the pass unwinds it, which
+    stops the pull in progress (rsync keeps its partial files) and saves
+    the pass's state, so the next pass resumes.  It is for a caller that
+    kills without warning, or wants each pass to end between pulls.
+    """
+    list_only, budget = False, 0
+    args = list(args)
+    while args:
+        arg = args.pop(0)
+        if arg == "--list":
+            list_only = True
+        elif arg.startswith("--max-seconds="):
+            budget = _whole_number(arg.split("=", 1)[1], "--max-seconds")
+        elif arg == "--max-seconds":
+            if not args:
+                die("--max-seconds needs a number of seconds", REAP_USAGE)
+            budget = _whole_number(args.pop(0), "--max-seconds")
+        else:
+            die("reap does not take %r" % arg, REAP_USAGE)
+    return list_only, budget
+
+
+def cmd_reap(args):
+    global ON_TICK
+    list_only, budget = _reap_options(args)
+    entries = _read_queue()
+    if not entries:
+        print("nothing tracked")
+        return 0
+    states = _job_states(sorted({e["job"] for e in entries}))
+    for entry in entries:
+        print("%s  %-12s  %s -> %s%s" % (
+            entry["job"], states.get(entry["job"], "UNKNOWN"), entry["src"],
+            entry["dest"], "  [cleanup]" if entry.get("cleanup") else ""))
+    if list_only:
+        return 0
+    lock = _reap_lock()
+    if lock is None:
+        print("another reap is running; skipping")
+        return 0
+    started = time.time()
+    returned, failed, waiting, unclean = [], [], [], []
+    seen, stopped = None, None
+    try:
+        seen, now = _load_seen(), int(time.time())
+        rq = return_queue_dir()
+        ON_TICK = lambda: _touch_lock(lock)  # noqa: E731
+        for entry in entries:
+            _touch_lock(lock)
+            job, state = entry["job"], states.get(entry["job"], "UNKNOWN")
+            # A job may own several independently returned roots.  Queue-file
+            # identity, not the shared Slurm id, is the debounce identity.
+            seen_key = entry.get("_file", job)
+            if not is_terminal(state):
+                seen.pop(seen_key, None)
+                waiting.append("%s (%s)" % (job, state))
+                continue
+            first_terminal = seen.setdefault(seen_key, now)
+            if now - first_terminal < 1:
+                # First sighting: wait one pass before acting, so a job that
+                # requeues itself on timeout (TIMEOUT -> PENDING) is not
+                # pulled — and above all not cleaned — mid-resurrection.
+                print("%s newly terminal (%s); acting next pass" % (job, state))
+                continue
+            if budget and time.time() - started > budget:
+                print("time budget spent; remaining jobs next pass")
+                break
+            if not _pull_run_dir(entry, state):
+                failed.append(job)
+                continue
+            # What to delete once the entry is retired, if anything.  The
+            # path is checked again here, at use time, because a queue entry
+            # written directly by code on NERSC never went through
+            # register_return, and the job is asked about once more because
+            # it may have been requeued since the pass began.
+            remove = None
+            if entry.get("cleanup"):
+                problem = cleanup_problem(entry["src"])
+                if problem:
+                    sys.stderr.write("nersc: not cleaning %s off scratch: %s\n"
+                                     % (job, problem))
+                else:
+                    recheck = _job_states([job], strict=False)
+                    if job not in recheck:
+                        sys.stderr.write(
+                            "nersc: could not recheck %s before cleaning it off "
+                            "scratch; the entry stays queued for the next pass\n"
+                            % job)
+                        failed.append(job)
+                        continue
+                    if not is_terminal(recheck[job]):
+                        # Requeued since the pass began: what was pulled is
+                        # a mid-run snapshot.  Keep the entry, and start its
+                        # debounce over, so the final output is returned
+                        # (and only then cleaned) once it really finishes.
+                        seen.pop(seen_key, None)
+                        waiting.append("%s (%s)" % (job, recheck[job]))
+                        continue
+                    remove = os.path.normpath(entry["src"])
+            # Retire first, delete second: a failed move keeps the source,
+            # so the next pass can redo the whole return, and a deleted
+            # source never leaves behind a live entry that would fail to
+            # pull on every later pass.
+            if not _retire(rq, entry):
+                failed.append(job)
+                continue
+            seen.pop(seen_key, None)
+            cleaned = ""
+            if remove:
+                if _clean_scratch(entry, remove):
+                    cleaned = ", scratch cleaned"
+                else:
+                    unclean.append(job)
+            returned.append(job)
+            print("returned %s (%s) -> %s%s" % (job, state, entry["dest"], cleaned))
+    except (KeyboardInterrupt, Terminated) as stop:
+        # Stopped part way: what was done is recorded below and the verdict
+        # still printed, and only then does the stop carry on outwards.
+        stopped = stop
+    finally:
+        ON_TICK = None
+        try:
+            # Saved even when stopped: without it, a pass that is always
+            # stopped (a scheduler's time limit) would forget each first
+            # sighting of a finished job and never act on one.
+            if seen is not None:
+                _save_seen(seen)
+        finally:
+            try:
+                lock.rmdir()
+            except OSError:
+                pass
+    # Always close with a verdict: a pass that returned nothing says why
+    # (still running, or failed), so silence never stands for "nothing to do".
+    print("reap: %d returned, %d failed, %d still running, %d tracked total"
+          % (len(returned), len(failed), len(waiting), len(entries)))
+    if failed:
+        print("      failed this pass (kept in the queue, retried next pass): %s"
+              % ", ".join(failed))
+    if unclean:
+        print("      returned, but not cleaned off scratch (see above): %s"
+              % ", ".join(unclean))
+    if stopped is not None:
+        print("      stopped by %s part way through; a pull it cut short "
+              "resumes next pass" % _signal_name(stopped))
+        sys.stdout.flush()
+        raise stopped
+    return 1 if failed or unclean else 0
+
+
+# --------------------------------------------------------------------------
+# job inspection
+# --------------------------------------------------------------------------
+
+def parse_scontrol(text):
+    """`scontrol show job` output -> {key: value} (first win per key)."""
+    info = {}
+    for token in text.split():
+        if "=" in token:
+            key, _, value = token.partition("=")
+            info.setdefault(key, value)
+    return info
+
+
+def _job_workdir(job):
+    """(state, workdir, stdout_path, extra) for a job, however old it is.
+
+    scontrol knows running/recent jobs (and the expanded StdOut path); sacct
+    covers everything after that; the return queue is the last resort for a
+    tracked job whose accounting is unreachable.
+    """
+    # For an array parent, scontrol can report the base record completed while
+    # one child is still running.  The aggregate sacct state is authoritative
+    # for monitoring and cleanup decisions.
+    aggregate_state = _job_states([job], strict=False).get(job)
+    code, out = remote_out(["scontrol", "show", "job", job])
+    if code == 0 and "WorkDir=" in out:
+        info = parse_scontrol(out)
+        extra = "runtime %s/%s on %s" % (info.get("RunTime", "?"),
+                                         info.get("TimeLimit", "?"),
+                                         info.get("NodeList", "?"))
+        return (aggregate_state or info.get("JobState", "?"), info.get("WorkDir"),
+                info.get("StdOut"), extra)
+    code, out = remote_out(["sacct", "-X", "-n", "-P", "-S", SACCT_START, "-j", job,
+                            "--format=State,Elapsed,WorkDir"])
+    if code == 0 and out.strip():
+        state, elapsed, workdir = (out.strip().splitlines()[0].split("|") + ["", ""])[:3]
+        if workdir:
+            return state, workdir, None, "elapsed %s" % elapsed
+    for entry in _read_queue():
+        if entry["job"] == job:
+            return "UNKNOWN", entry["src"], None, "from the return queue"
+    return None, None, None, None
+
+
+def cmd_peek(rest):
+    rest = list(rest)
+    lines = 40
+    if "-n" in rest:
+        idx = rest.index("-n")
+        if idx + 1 >= len(rest):
+            die("-n needs a line count")
+        lines = _whole_number(rest[idx + 1], "-n")
+        del rest[idx:idx + 2]
+    if not rest:
+        die("usage: nersc peek JOBID [FILE] [-n LINES]")
+    job = rest[0]
+    if not JOB_ID_RE.match(job):
+        die("'%s' does not look like a Slurm job id" % job)
+    file_arg = rest[1] if len(rest) > 1 else None
+
+    state, workdir, stdout_path, extra = _job_workdir(job)
+    if workdir is None:
+        die("job %s is unknown to scontrol, sacct and the return queue" % job)
+    print("job %s: %s (%s)" % (job, state, extra))
+    print("run dir: %s" % workdir)
+    sys.stdout.flush()  # the remote output below bypasses this buffer
+    if state.startswith("PENDING") and not file_arg:
+        print("(not started; nothing to tail yet)")
+        return 0
+
+    if file_arg:
+        target = file_arg if file_arg.startswith("/") else "%s/%s" % (workdir, file_arg)
+        tail_cmd = ("tail -n %d %s 2>/dev/null || echo '(file not there yet)'"
+                    % (lines, shlex.quote(target)))
+        label = target
+    elif stdout_path:
+        tail_cmd = ("tail -n %d %s 2>/dev/null || echo '(no output yet)'"
+                    % (lines, shlex.quote(stdout_path)))
+        label = stdout_path
+    else:
+        # finished job with no recorded StdOut: newest .out/.log in the run dir
+        tail_cmd = ("f=$(ls -t *.out *.log 2>/dev/null | head -1); "
+                    "if [ -n \"$f\" ]; then echo \"[$f]\"; tail -n %d \"$f\"; "
+                    "else echo '(no .out/.log file here)'; fi" % lines)
+        label = "newest .out/.log"
+    banner = "----- %s (last %d lines) -----" % (label, lines)
+    script = ("cd %s 2>/dev/null || { echo 'run dir is gone (returned/cleaned?)'; exit 0; }; "
+              "ls -lt | head -15; echo; echo %s; %s"
+              % (shlex.quote(workdir), shlex.quote(banner), tail_cmd))
+    return remote_run(["bash", "-c", script])
+
+
+def cmd_fetch(rest):
+    rest = list(rest)
+    if not rest:
+        die("usage: nersc fetch JOBID [DEST]")
+    job = rest[0]
+    if not JOB_ID_RE.match(job):
+        die("'%s' does not look like a Slurm job id" % job)
+    state, workdir, _, extra = _job_workdir(job)
+    if workdir is None:
+        die("job %s is unknown to scontrol, sacct and the return queue" % job)
+    dest = rest[1] if len(rest) > 1 else default_dest(workdir)
+    if not dest:
+        die("no default destination for %s" % workdir, *_no_default_dest_hints())
+    print("job %s: %s (%s)" % (job, state, extra))
+    print("fetching %s -> %s" % (workdir, dest))
+    sys.stdout.flush()
+    if not _pull_run_dir({"job": job, "src": workdir, "dest": dest,
+                          "cleanup": False}, state):
+        die("fetch of %s failed" % job)
+    if not is_terminal(state):
+        print("fetched a snapshot; the job is still %s — rerun to refresh" % state)
+    else:
+        print("fetched")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# health
+# --------------------------------------------------------------------------
+
+def cmd_status(args):
+    quick = "--quick" in args
+    print("nersc tool %s on %s" % (VERSION, os.uname()[1].split(".")[0]))
+    print("certificate: %s" % describe_cert())
+    print("connection: %s" % ("up" if master_alive() else "down (opens on demand)"))
+    if quick:
+        return 0
+    left = cert_seconds_left()
+    if left is None or left <= 0:
+        return 1
+    code, out = remote_out(["squeue", "--me", "-h", "-o", "%T"])
+    if code == 0:
+        states = out.split()
+        summary = {}
+        for state in states:
+            summary[state] = summary.get(state, 0) + 1
+        pretty = ", ".join("%d %s" % (n, s.lower()) for s, n in sorted(summary.items()))
+        print("jobs: %s" % (pretty or "none queued"))
+    else:
+        print("jobs: (squeue failed, rc=%d)" % code)
+    stamp = STATE_DIR / "last-sync"
+    if not mirror_src():
+        print("mirror: not configured")
+    elif stamp.is_file():
+        try:
+            age = time.time() - int(stamp.read_text().strip() or 0)
+        except (OSError, ValueError):
+            print("mirror: sync time unreadable (%s)" % stamp)
+        else:
+            print("mirror: synced %s ago" % _ago(age))
+    else:
+        print("mirror: never synced from this account")
+    return 0
+
+
+def cmd_config(args):
+    """Print the effective configuration: every key, where its value came
+    from, and any key in the file that this tool does not know."""
+    if args:
+        die("usage: nersc config")
+    in_file = _config_file_values()
+    if CONFIG_PATH.is_file():
+        print("config: %s" % CONFIG_PATH)
+    else:
+        print("config: %s (absent: every value is a default)" % CONFIG_PATH)
+    for key in DEFAULTS:
+        value = CFG.get(key, "")
+        origin = "" if key in in_file else "  (default)"
+        print("  %s = %s%s" % (key, value, origin))
+    for key in sorted(set(in_file) - set(DEFAULTS)):
+        print("  %s = %s  (not a setting this tool reads)" % (key, in_file[key]))
+    return 0
+
+
+ENV_SNAPSHOT_SNIPPET = (
+    "import json, re\n"
+    "from importlib.metadata import distributions\n"
+    "packages = {}\n"
+    "for dist in distributions():\n"
+    "    name = dist.metadata.get('Name')\n"
+    "    if not name:\n"
+    "        continue\n"
+    "    key = re.sub(r'[-_.]+', '-', name).lower()\n"
+    "    packages[key] = dist.version\n"
+    "print(json.dumps(packages, sort_keys=True))\n"
+)
+#: Distributions NERSC adds to Python environments on Perlmutter itself (its
+#: usage monitoring), so their presence there alone is not drift.
+NERSC_SITE_ONLY_PACKAGES = ("nersc-pymon",)
+
+
+def _some(names, shown=3):
+    """The first *shown* of *names*, then how many more there are."""
+    text = ", ".join(names[:shown])
+    if len(names) > shown:
+        text += " and %d more" % (len(names) - shown)
+    return text
+
+
+def check_env_parity():
+    """Compare the two live venvs using distribution metadata only."""
+    src = mirror_src().rstrip("/")
+    if not src or not (CFG.get("mirror_dest") or "").strip():
+        return "no code mirror configured", "not checked"
+    local_python = os.path.join(src, ".venv", "bin", "python")
+    if not os.path.exists(local_python):
+        return (
+            "no venv at %s"
+            % os.path.dirname(os.path.dirname(local_python)),
+            "not checked",
+        )
+    try:
+        proc = subprocess.run(
+            [local_python, "-c", ENV_SNAPSHOT_SNIPPET],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=60,
+        )
+        local_packages = (
+            json.loads(proc.stdout) if proc.returncode == 0 else None
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return "check failed (%s)" % exc, "not checked"
+    if not isinstance(local_packages, dict):
+        return (
+            "metadata snapshot failed (rc=%d)" % proc.returncode,
+            "not checked",
+        )
+    dest = expand_remote(CFG["mirror_dest"].strip()).rstrip("/")
+    code, out = remote_out(
+        ["%s/.venv/bin/python" % dest, "-c", ENV_SNAPSHOT_SNIPPET],
+    )
+    local = "OK (%d installed distributions)" % len(local_packages)
+    if code != 0:
+        return local, "NERSC venv metadata check failed (rc=%d)" % code
+    try:
+        remote_packages = json.loads(out)
+    except ValueError:
+        return local, "NERSC venv returned malformed metadata"
+    if not isinstance(remote_packages, dict):
+        return local, "NERSC venv returned non-object metadata"
+    ignored = set(NERSC_SITE_ONLY_PACKAGES)
+    missing = sorted(set(local_packages) - set(remote_packages))
+    extra = sorted(set(remote_packages) - set(local_packages) - ignored)
+    drift = sorted(
+        name
+        for name in set(local_packages) & set(remote_packages)
+        if local_packages[name] != remote_packages[name]
+    )
+    if missing or extra or drift:
+        details = []
+        if missing:
+            details.append("missing: %s" % _some(missing))
+        if extra:
+            details.append("extra: %s" % _some(extra))
+        if drift:
+            details.append("version drift: %s" % _some([
+                "%s %s/%s" % (name, local_packages[name], remote_packages[name])
+                for name in drift
+            ]))
+        remote = "DRIFT (%s)" % "; ".join(details)
+    else:
+        site_only = len(set(remote_packages) & ignored)
+        remote = "OK (%d matched%s)" % (
+            len(local_packages),
+            "; %d NERSC-only ignored" % site_only if site_only else "",
+        )
+    return local, remote
+
+
+def env_parity_enabled():
+    """Whether live distribution parity should be checked by doctor."""
+    mode = CFG.get("env_parity", "auto").strip().lower()
+    if mode not in ("auto", "on", "off"):
+        sys.stderr.write(
+            "nersc: invalid env_parity=%r in %s; expected auto, on or off; "
+            "using auto\n" % (CFG.get("env_parity"), CONFIG_PATH)
+        )
+        mode = "auto"
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    src = mirror_src().rstrip("/")
+    return bool(src) and os.path.isfile(os.path.join(src, ".venv", "bin", "python"))
+
+
+def cmd_doctor(args):
+    problems = 0
+    print("nersc tool %s" % VERSION)
+    left = cert_seconds_left()
+    print("certificate: %s (%s)" % (describe_cert(), cert_file()))
+    if left is None or left <= 0:
+        print("  -> %s" % CFG["refresh_hint"])
+        problems += 1
+    print("pool %s:22: %s" % (CFG["pool"], "reachable" if _tcp_ok(CFG["pool"]) else "UNREACHABLE"))
+    for host in CFG["dtns"].split():
+        print("dtn %s:22: %s" % (host, "reachable" if _tcp_ok(host) else "unreachable"))
+    if left and left > 0:
+        ensure_master(quiet=False)
+        started = time.time()
+        code, out = remote_out(["hostname"])
+        if code == 0:
+            print("round trip: %s in %.1fs" % (out.strip(), time.time() - started))
+        else:
+            print("round trip FAILED (rc=%d)" % code)
+            problems += 1
+        code, out = remote_out(["bash", "-lc", "echo scratch=$PSCRATCH"])
+        if code == 0:
+            print("remote %s" % out.strip().splitlines()[-1])
+        if env_parity_enabled():
+            local_env, remote_env = check_env_parity()
+            print("env parity (live installed-distribution metadata):")
+            print("  local venv: %s" % local_env)
+            print("  nersc venv: %s" % remote_env)
+            if "OK" not in local_env or "OK" not in remote_env:
+                print("  -> align the local/NERSC venv package sets, then rerun doctor")
+                problems += 1
+        elif CFG.get("env_parity", "auto").strip().lower() == "off":
+            print("env parity: off")
+        else:
+            print("env parity: skipped (local mirror venv is absent; "
+                  "set env_parity = on to require it)")
+    print("config: %s" % (CONFIG_PATH if CONFIG_PATH.is_file() else "defaults (no config file)"))
+    if mirror_src():
+        print("mirror: %s -> ~/%s" % (mirror_src(), CFG.get("mirror_dest", "").strip()))
+        print("mirror excludes: %s" % (EXCLUDE_PATH if EXCLUDE_PATH.is_file() else "MISSING"))
+    else:
+        print("mirror: not configured (sync and the syncing submit are off)")
+    print("return root: %s" % (return_root() or "not configured (returns need an explicit DEST)"))
+    line, bad = describe_hooks()
+    print(line)
+    problems += bad
+    return 1 if problems else 0
+
+
+def describe_hooks():
+    """(one doctor line, 1 if the hooks file is broken else 0)."""
+    if not (CFG.get("hooks") or "").strip():
+        return "hooks: none", 0
+    if HOOKS_ERROR:
+        return ("hooks: %s FAILED TO LOAD (%s)\n  -> the default submit form is "
+                "refused until it loads" % (CFG["hooks"], HOOKS_ERROR)), 1
+    provided = [name for name in ("submit_argv", "submit_inputs",
+                                  "SUBMIT_INPUT_EXCLUDES", "return_excludes")
+                if getattr(HOOKS, name, None) is not None]
+    return "hooks: %s (%s)" % (CFG["hooks"], ", ".join(provided) or "defines nothing"), 0
+
+
+# --------------------------------------------------------------------------
+# dispatch
+# --------------------------------------------------------------------------
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] == "--version":
+        print(VERSION)
+        return 0
+    verb, rest = argv[0], argv[1:]
+
+    if verb == "sbatch":
+        return cmd_sbatch(rest)
+    if verb == "track":
+        return cmd_track(rest)
+    if verb == "reap":
+        return cmd_reap(rest)
+    if verb == "peek":
+        return cmd_peek(rest)
+    if verb == "fetch":
+        return cmd_fetch(rest)
+    if verb in SLURM_VERBS:
+        if verb == "squeue" and not rest:
+            rest = ["--me"]
+        return remote_run([verb] + rest)
+    if verb in ("q", "jobs"):
+        return remote_run(["squeue", "--me", "-o",
+                           "%.10i %.16j %.10P %.8T %.10M %.10l %R"] + rest)
+    if verb == "run":
+        cd = None
+        if rest[:1] == ["--cd"]:
+            if len(rest) < 2:
+                die("--cd needs a directory")
+            cd = expand_remote(rest[1])
+            rest = rest[2:]
+        if rest[:1] == ["--"]:
+            rest = rest[1:]
+        if not rest:
+            die("nothing to run", "usage: nersc run [--cd DIR] [--] CMD ...")
+        return remote_run(rest, cd=cd)
+    if verb == "sh":
+        if not rest:
+            die("usage: nersc sh 'SHELL LINE'")
+        return remote_run(["bash", "-lc", " ".join(rest)])
+    if verb == "shell":
+        ensure_master(quiet=False)
+        return subprocess.run(mux_ssh(extra=("-t",), batch=False)).returncode
+    if verb == "push":
+        return rsync_transfer(rest, up=True)
+    if verb == "pull":
+        return rsync_transfer(rest, up=False)
+    if verb == "sync":
+        return cmd_sync(rest)
+    if verb == "submit":
+        return cmd_submit(rest)
+    if verb == "cert":
+        print("certificate: %s (%s)" % (describe_cert(), cert_file()))
+        return 0 if (cert_seconds_left() or 0) > 0 else 1
+    if verb == "status":
+        return cmd_status(rest)
+    if verb == "config":
+        return cmd_config(rest)
+    if verb == "doctor":
+        return cmd_doctor(rest)
+    if verb == "connect":
+        ensure_master(quiet=False)
+        print("connection up")
+        return 0
+    if verb == "disconnect":
+        if master_alive():
+            subprocess.run(["ssh", "-F", "/dev/null", "-o", "ControlPath=%s" % sock_path(),
+                            "-O", "exit", "dummy"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("connection closed")
+        else:
+            print("no connection open")
+        return 0
+
+    die("unknown verb '%s'" % verb, "run `nersc --help` for the verb list")
+
+
+def _entry(argv):
+    """main(), ended by a signal or Ctrl-C the way a shell expects."""
+    unwind_on_signals()
+    try:
+        return main(argv)
+    except (KeyboardInterrupt, Terminated) as stop:
+        sys.stderr.write("nersc: stopped by %s\n" % _signal_name(stop))
+        return stop.code if isinstance(stop, Terminated) else 130
+
+
+if __name__ == "__main__":
+    sys.exit(_entry(sys.argv[1:]))

@@ -1,0 +1,50 @@
+# home.filter: what archive-sync leaves out of a cluster home when that
+# backend has no filter of its own. It leaves out what can be installed,
+# rebuilt or downloaded again, and keeps everything else.
+#
+# To change it for one backend, copy it to
+# ~/.config/cluster/archive/<backend>-home.filter (fasrc-home.filter, say) and
+# edit the copy; archive-sync uses the copy from then on.
+# `archive-sync --show-config` says which filter is in use.
+#
+# The syntax is rclone's: the first rule that matches a path wins, "- "
+# excludes and "+ " includes, a leading / anchors a rule at the top of the
+# home, and dir/** matches a directory and everything in it. Only whole lines
+# are comments: text after a rule becomes part of its pattern.
+#
+# Symlinks that lead out of the home (into scratch or project space) need no
+# rule here: archive-sync fences them on every run. A directory that holds a
+# file named .nosync is left out too, with everything in it.
+#
+# Version-control directories (.git) are kept: they can hold commits and
+# branches that exist nowhere else. If every repository in the home is pushed
+# somewhere, a "- .git/**" line in your copy makes the archive much smaller.
+
+# Conda and Python installations and environments
+- /.conda/**
+- /miniconda3/**
+- /anaconda3/**
+- /miniforge3/**
+- /mambaforge/**
+- /.local/lib/**
+- .venv/**
+- venv/**
+- .tox/**
+
+# JavaScript packages
+- /.npm/**
+- /.nvm/**
+- node_modules/**
+
+# Caches
+- /.cache/**
+- __pycache__/**
+- .pytest_cache/**
+- .mypy_cache/**
+- .ipynb_checkpoints/**
+
+# Editor servers, installed again on the next connection
+- /.vscode-server/**
+
+# Editor swap files
+- *.swp

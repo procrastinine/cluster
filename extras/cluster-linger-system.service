@@ -1,0 +1,55 @@
+# cluster-linger.service (system) — assert linger before this machine's
+# connections to the cluster go away. Install this one wherever you have root:
+# it is the only form with an ordering guarantee. cluster-linger.service beside
+# it is the user-manager version, which needs no root and is best effort.
+#
+# Why the ordering is the whole design. The SSH control masters live in a user
+# *session* scope, and a --user unit lives in the user manager:
+#
+#     /user.slice/user-UID.slice/session-N.scope       <- masters, watcher
+#     /user.slice/user-UID.slice/user@UID.service      <- a --user unit
+#
+# Those are siblings. Nothing orders one against the other at shutdown, so a
+# user unit asserting linger may perfectly well run after the masters it needs
+# have already been killed. A *system* unit can be ordered against the whole
+# user slice, and stop order is the reverse of start order: After= here means
+# this unit's ExecStop runs while the sessions — and the network — are still
+# up. That instant is when the FASRC node decides whether to keep your tmux
+# server, and this is the only hook guaranteed to be standing in it.
+#
+# Install: `cluster linger --install-hook` fills in the placeholders and does
+# the rest. By hand, from the checkout, with `cluster` on PATH:
+#     sed -e "s/@USER@/$USER/g" -e "s#@HOME@#$HOME#g" \
+#         -e "s#@CLUSTER@#$(command -v cluster)#g" -e "s#@REPO@#$PWD#g" \
+#         extras/cluster-linger-system.service \
+#       | sudo tee /etc/systemd/system/cluster-linger.service >/dev/null
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now cluster-linger.service
+#
+# "active (exited)" is what correct looks like: it does nothing until stopped.
+# `cluster doctor` reports it. Remove with:
+#     sudo systemctl disable --now cluster-linger.service
+
+[Unit]
+Description=Keep cluster tmux sessions alive across a reboot of this machine
+Documentation=file:@REPO@/USAGE.md
+# Ordering only — none of these are wanted or required here, they simply have
+# to outlive this unit's ExecStop. user.slice holds the control masters,
+# systemd-logind terminates the sessions containing them, and the assertion
+# itself travels over the network.
+After=network.target user.slice systemd-logind.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=@USER@
+Environment=HOME=@HOME@
+ExecStart=/bin/true
+# Leading '-': best effort by nature — a node may be unreachable or its logind
+# wedged — and a shutdown must not be made to look broken by it. `cluster
+# linger` reports what happened to the journal either way.
+ExecStop=-@CLUSTER@ linger --quiet
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+# archive-sync-cron — unattended daily wrapper around `archive-sync`.
+#
+# Optional, like archive-sync itself (see extras/README.md). Install it in a
+# crontab, e.g.   0 8 * * * $HOME/.local/bin/archive-sync-cron
+# Everything it and archive-sync print goes to
+# ~/.local/state/cluster/archive-sync/cron.log (XDG_STATE_HOME moves it); the
+# detailed rclone log is the per-run sync-<backend>-<timestamp>.log that
+# archive-sync writes itself. While archive-sync is not configured it refuses,
+# on stderr, without creating anything.
+#
+# Why a wrapper rather than putting the command straight in the crontab:
+#   * cron's PATH is /usr/bin:/bin, so `cluster` (~/.local/bin) and rclone
+#     (/usr/local/bin, /opt/homebrew/bin) would not be found;
+#   * --progress writes a redrawing status line, which is noise in a log file;
+#   * a run that fails for a passing reason (a dropped master, an in-flight
+#     TOTP window) deserves another try before it is written off until
+#     tomorrow, and a long one that keeps getting further deserves as many as
+#     fit in the day (see "Trying again" below);
+#   * per-run sync logs would otherwise accumulate forever.
+#
+# Which backends it mirrors, in order: BACKENDS in the archive-sync config
+# (or ARCHIVE_SYNC_BACKENDS). Pass --backend X to do just one. Any arguments are
+# passed through to archive-sync, so the exact thing cron runs can be
+# rehearsed with:  archive-sync-cron --dry-run
+#
+# Trying again: every backend has its first try before any is tried again,
+# so one that keeps failing never keeps the others waiting. A failed run is
+# tried again by the rule the `cluster` tool's own reconnects follow. Each
+# failure counts one, and the time a failed run spent getting further fades
+# the count, halving it every ARCHIVE_SYNC_RETRY_HALF_LIFE seconds (1800).
+# Getting further is its log recording a file copied, moved or deleted, unless
+# it failed on nothing but the files and directories the try before it failed
+# on: that failure is theirs (unreadable, or changing as they are read), and
+# what else it copied is a live home changing, not progress. The wait before the
+# next try starts at ARCHIVE_SYNC_RETRY_WAIT (600) and doubles with the count,
+# up to ARCHIVE_SYNC_RETRY_WAIT_MAX (3600). More than ARCHIVE_SYNC_RETRIES (2)
+# failures in quick succession leave the backend for the next run, and so
+# does a try that would start more than ARCHIVE_SYNC_RETRY_WINDOW seconds
+# (72000, 20 hours) after the wrapper did: keep it below the cron interval,
+# so that one run is over before the next begins. A run that is going is
+# never cut short. So a cluster that is down costs a few tries, and a long
+# first sync that drops now and then is carried on for as long as the window
+# lasts, and taken up by the next run from where it stopped. A run ended by a
+# signal (exit 129, 130, 143 and the like) was stopped, by someone or by a
+# shutdown, and nothing more is tried.
+#
+# Exit status: archive-sync's (see archive-sync --help), the last non-zero one
+# when there are several backends; 4 also means an earlier archive-sync-cron
+# is still running.
+set -uo pipefail
+
+case "${1-}" in
+    -h|--help)
+        sed -n '2,/^[^#]/p' "$0" | sed '$d;s/^# \{0,1\}//'
+        exit 0
+        ;;
+esac
+
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+
+# This script's directory, through any symlinks to it, so that a symlink in
+# ~/.local/bin still finds the archive-sync it was shipped with.
+script_dir() {
+    local path="$1" dir target
+    while [ -L "$path" ]; do
+        dir="$(CDPATH='' cd -P "$(dirname "$path")" && pwd)"
+        target="$(readlink "$path")"
+        case "$target" in
+            /*) path="$target" ;;
+            *) path="$dir/$target" ;;
+        esac
+    done
+    CDPATH='' cd -P "$(dirname "$path")" && pwd
+}
+# The archive-sync beside this script, else whichever one is on PATH.
+ARCHIVE_SYNC="$(script_dir "$0")/archive-sync"
+[ -x "$ARCHIVE_SYNC" ] || ARCHIVE_SYNC="archive-sync"
+
+# The same place archive-sync keeps its state: XDG_STATE_HOME when it is an
+# absolute path, else ~/.local/state.
+case "${XDG_STATE_HOME-}" in
+    /*) STATE_DIR="$XDG_STATE_HOME/cluster/archive-sync" ;;
+    *) STATE_DIR="$HOME/.local/state/cluster/archive-sync" ;;
+esac
+CRON_LOG="$STATE_DIR/cron.log"
+KEEP_DAYS="${ARCHIVE_SYNC_KEEP_LOG_DAYS:-30}"   # per-run sync logs
+CRON_LOG_MAX="${ARCHIVE_SYNC_CRON_LOG_MAX:-5242880}"  # 5 MiB, then rotate once
+RETRIES="${ARCHIVE_SYNC_RETRIES:-2}"            # see "Trying again" above
+RETRY_WAIT="${ARCHIVE_SYNC_RETRY_WAIT:-600}"
+RETRY_WAIT_MAX="${ARCHIVE_SYNC_RETRY_WAIT_MAX:-3600}"
+RETRY_HALF_LIFE="${ARCHIVE_SYNC_RETRY_HALF_LIFE:-1800}"
+RETRY_WINDOW="${ARCHIVE_SYNC_RETRY_WINDOW:-72000}"
+STALE_DAYS="${ARCHIVE_SYNC_STALE_DAYS:-2}"
+
+stamp() { date -u +%FT%TZ; }
+
+# Ask archive-sync what to mirror before touching anything. Exit 3 is "not
+# configured": say so where cron will show it (stderr, i.e. cron mail), and
+# leave no log directory behind for an extra nobody asked for.
+cfg_out="$("$ARCHIVE_SYNC" --list-backends 2>&1)"; cfg_rc=$?
+if [ "$cfg_rc" -eq 3 ]; then
+    printf '%s\n' "$cfg_out" >&2
+    exit 3
+fi
+
+(umask 077 && mkdir -p "$STATE_DIR")
+
+# Rotate the cron log before appending, so it cannot grow without bound.
+if [ -f "$CRON_LOG" ] && [ "$(wc -c < "$CRON_LOG")" -gt "$CRON_LOG_MAX" ]; then
+    mv -f "$CRON_LOG" "$CRON_LOG.1"
+fi
+exec >>"$CRON_LOG" 2>&1
+
+if [ "$cfg_rc" -ne 0 ]; then
+    echo "[$(stamp)] archive-sync configuration error (exit $cfg_rc):"
+    printf '%s\n' "$cfg_out" | sed 's/^/  /'
+    exit "$cfg_rc"
+fi
+
+# lock_fd FD: as in archive-sync. 0 held, 1 held by another process, 2 cannot
+# be tried; python3 stands in for flock(1) where there is none (macOS).
+lock_fd() {
+    local rc=0
+    if command -v flock >/dev/null 2>&1; then
+        flock -n "$1" || rc=$?
+    else
+        python3 -c '
+import errno, fcntl, sys
+try:
+    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError as exc:
+    sys.exit(1 if exc.errno in (errno.EAGAIN, errno.EACCES) else 2)
+' "$1" 2>/dev/null || rc=$?
+    fi
+    case "$rc" in
+        0|1) return "$rc" ;;
+        *) return 2 ;;
+    esac
+}
+
+# Never let two cron runs stack up: archive-sync has its own lock and would
+# refuse, and the second run would only log that.
+exec 8>"$STATE_DIR/cron.lock"
+lock_rc=0
+lock_fd 8 || lock_rc=$?
+case "$lock_rc" in
+    0) ;;
+    1) echo "[$(stamp)] previous archive-sync-cron still running — skipping"; exit 4 ;;
+    *) echo "[$(stamp)] cannot lock $STATE_DIR/cron.lock: it needs flock(1) or python3"; exit 2 ;;
+esac
+
+# The backends to mirror in order, or just the one --backend names, which
+# archive-sync then receives with the rest of the arguments.
+BACKENDS="$cfg_out"
+ONLY=""
+prev=""
+for arg in "$@"; do
+    [ "$prev" != "--backend" ] || ONLY="$arg"
+    case "$arg" in --backend=*) ONLY="${arg#--backend=}" ;; esac
+    prev="$arg"
+done
+
+# The failure memory of "Trying again", in awk for its arithmetic.
+# memory_fail SCORE HEALTHY HALF_LIFE CEILING: the score after one more
+# failure, which came after HEALTHY seconds of getting further.
+memory_fail() {
+    awk -v s="$1" -v h="$2" -v l="$3" -v c="$4" 'BEGIN {
+        if (h > 0 && s > 0) s = (l > 0) ? s * 0.5 ^ (h / l) : 0
+        s = s + 1
+        if (s > c) s = c
+        printf "%.6f\n", s }'
+}
+# memory_ceiling DELAY DELAY_MAX LIMIT: the highest score worth keeping, the
+# one whose wait has reached DELAY_MAX or one past LIMIT, whichever is higher:
+# past it, one more failure changes nothing.
+memory_ceiling() {
+    awk -v d="$1" -v m="$2" -v n="$3" 'BEGIN {
+        steps = 0
+        if (d > 0) for (w = d; w < m; w *= 2) steps++
+        top = 1 + steps
+        if (n + 1 > top) top = n + 1
+        printf "%.6f\n", top }'
+}
+# memory_exhausted SCORE LIMIT: whether SCORE is past LIMIT.
+memory_exhausted() { awk -v s="$1" -v n="$2" 'BEGIN { exit !(s > n) }'; }
+# memory_wait SCORE DELAY DELAY_MAX: whole seconds to wait before the next try.
+memory_wait() {
+    awk -v s="$1" -v d="$2" -v m="$3" 'BEGIN {
+        steps = s - 1
+        if (steps < 0) { print 0; exit }
+        if (steps > 64) steps = 64
+        if (m < d) m = d
+        w = d * 2 ^ steps
+        if (w > m) w = m
+        printf "%d\n", w + 0.5 }'
+}
+# memory_fresh SCORE: how many recent failures SCORE amounts to.
+memory_fresh() { awk -v s="$1" 'BEGIN { printf "%d\n", s + 0.5 }'; }
+
+# number NAME VALUE: VALUE, or the end of the run when it is not a number of
+# 0 or more, since every try would be judged by it.
+number() {
+    case "$2" in
+        ''|.|*[!0-9.]*|*.*.*)
+            echo "[$(stamp)] $1=$2 is not a number of 0 or more"
+            exit 2 ;;
+    esac
+}
+number ARCHIVE_SYNC_RETRIES "$RETRIES"
+number ARCHIVE_SYNC_RETRY_WAIT "$RETRY_WAIT"
+number ARCHIVE_SYNC_RETRY_WAIT_MAX "$RETRY_WAIT_MAX"
+number ARCHIVE_SYNC_RETRY_HALF_LIFE "$RETRY_HALF_LIFE"
+number ARCHIVE_SYNC_RETRY_WINDOW "$RETRY_WINDOW"
+CEILING="$(memory_ceiling "$RETRY_WAIT" "$RETRY_WAIT_MAX" "$RETRIES")"
+
+# newest_log BACKEND: the newest per-run sync log of BACKEND, or nothing. The
+# names end in a timestamp, so the glob's order is their age.
+newest_log() {
+    local log newest=""
+    for log in "$STATE_DIR"/sync-"$1"-*.log; do
+        [ -f "$log" ] && newest="$log"
+    done
+    printf '%s' "$newest"
+}
+
+# failed_paths LOG: the paths rclone's log records failing, sorted: a file it
+# failed to copy, or a directory it could not read.
+failed_paths() {
+    sed -n -e 's/^.* ERROR : \(.*\): Failed to .*$/\1/p' \
+        -e 's/^.* ERROR : \(.*\): error reading .*$/\1/p' "$1" | LC_ALL=C sort -u
+}
+
+# got_further BACKEND BEFORE FAILED: whether the run that has just ended got
+# further: it left a log of its own (one newer than BEFORE) in which rclone
+# records a file copied, moved or deleted, and it did not fail on only the
+# paths the try before it failed on, which FAILED lists and is then made to
+# list this run's. rclone's next run takes up from there.
+got_further() {
+    local log repeated=""
+    log="$(newest_log "$1")"
+    [ -n "$log" ] && [ "$log" != "$2" ] || return 1
+    failed_paths "$log" > "$3.new"
+    if [ -s "$3.new" ] && [ -f "$3" ] &&
+        [ -z "$(LC_ALL=C comm -13 "$3" "$3.new")" ]; then
+        repeated=1
+    fi
+    mv -f "$3.new" "$3"
+    [ -z "$repeated" ] && grep -Eq ': (Copied|Moved|Deleted|Updated)' "$log"
+}
+
+run() {
+    # --progress=false overrides the --progress archive-sync passes (rclone
+    # honours the last occurrence of a bool flag); --stats-one-line keeps the
+    # periodic stats in the sync log readable.
+    "$ARCHIVE_SYNC" --progress=false --stats 5m --stats-one-line "$@"
+}
+
+# What is known of each backend to mirror, by its place in NAMES: its failure
+# score, when its next try is due, how many it has had, when the first began,
+# its last exit status, and whether it is finished for this run.
+NAMES=() SCORE=() DUE=() TRIES=() BEGAN=() STATUS=() FINISHED=()
+if [ -n "$ONLY" ]; then
+    NAMES[0]=""
+else
+    for backend in $BACKENDS; do
+        NAMES[${#NAMES[@]}]="$backend"
+    done
+fi
+i=0
+while [ "$i" -lt "${#NAMES[@]}" ]; do
+    SCORE[i]=0 DUE[i]=0 TRIES[i]=0 BEGAN[i]=0 STATUS[i]=0 FINISHED[i]=0
+    i=$((i + 1))
+done
+STOPPED=""
+
+# finish I: backend I is done for this run; say how it ended.
+finish() {
+    local i="$1" name="${NAMES[$1]}" elapsed
+    elapsed=$(( $(date +%s) - BEGAN[$1] ))
+    FINISHED[i]=1
+    rm -f "$STATE_DIR/cron-failed-${name:-$ONLY}"
+    printf '[%s] %sfinished exit=%d in %dm%02ds\n' "$(stamp)" "${name:+$name }" \
+        "${STATUS[$i]}" "$((elapsed / 60))" "$((elapsed % 60))"
+}
+
+# attempt I ARGS...: one try of backend I, and what it leaves to do.
+attempt() {
+    local i="$1"; shift
+    local backend="${NAMES[$i]}" rc=0 began before healthy=0 further="" wait now
+    local label="${backend:+$backend }" logged="${backend:-$ONLY}"
+    TRIES[i]=$((TRIES[i] + 1))
+    began=$(date +%s)
+    if [ "${TRIES[$i]}" -eq 1 ]; then
+        BEGAN[i]=$began
+        echo "[$(stamp)] ${label}sync starting"
+    fi
+    before="$(newest_log "$logged")"
+    if [ -n "$backend" ]; then
+        run --backend "$backend" "$@" || rc=$?
+    else
+        run "$@" || rc=$?
+    fi
+    STATUS[i]=$rc
+    case "$rc" in
+        0) finish "$i"; return ;;
+        2|3) echo "[$(stamp)] ${label}failed (exit $rc): a configuration or usage" \
+                  "error, so it is not retried"
+             finish "$i"; return ;;
+        4) echo "[$(stamp)] ${label}skipped: another archive-sync for it is running"
+           finish "$i"; return ;;
+    esac
+    if [ "$rc" -gt 128 ]; then
+        echo "[$(stamp)] ${label}stopped by a signal (exit $rc), so nothing more" \
+             "is tried in this run"
+        STOPPED=$rc
+        finish "$i"; return
+    fi
+    if got_further "$logged" "$before" "$STATE_DIR/cron-failed-$logged"; then
+        healthy=$(( $(date +%s) - began ))
+        further=" after getting further"
+    fi
+    SCORE[i]="$(memory_fail "${SCORE[$i]}" "$healthy" "$RETRY_HALF_LIFE" "$CEILING")"
+    if memory_exhausted "${SCORE[$i]}" "$RETRIES"; then
+        echo "[$(stamp)] ${label}attempt ${TRIES[$i]} failed (exit $rc)$further;" \
+             "$(memory_fresh "${SCORE[$i]}") failures in quick succession, so it is" \
+             "left for the next run (ARCHIVE_SYNC_RETRIES=$RETRIES)"
+        finish "$i"; return
+    fi
+    wait="$(memory_wait "${SCORE[$i]}" "$RETRY_WAIT" "$RETRY_WAIT_MAX")"
+    now=$(date +%s)
+    if awk -v n="$now" -v w="$wait" -v s="$started" -v r="$RETRY_WINDOW" \
+        'BEGIN { exit !(n + w > s + r) }'; then
+        echo "[$(stamp)] ${label}attempt ${TRIES[$i]} failed (exit $rc)$further;" \
+             "a try in ${wait}s would start past this run's" \
+             "ARCHIVE_SYNC_RETRY_WINDOW (${RETRY_WINDOW}s), so it is left for the" \
+             "next run"
+        finish "$i"; return
+    fi
+    DUE[i]=$((now + wait))
+    echo "[$(stamp)] ${label}attempt ${TRIES[$i]} failed (exit $rc)$further — retrying in ${wait}s"
+}
+
+started=$(date +%s)
+echo "[$(stamp)] archive-sync-cron starting${*:+ (args: $*)}"
+
+# One backend failing must not stop the others: they are independent mirrors,
+# and a cluster being down is the common case. So the next try is always the
+# one due soonest, and every first try is due at once.
+while [ -z "$STOPPED" ]; do
+    next="" i=0
+    while [ "$i" -lt "${#NAMES[@]}" ]; do
+        if [ "${FINISHED[$i]}" = 0 ] &&
+            { [ -z "$next" ] || [ "${DUE[$i]}" -lt "${DUE[$next]}" ]; }; then
+            next=$i
+        fi
+        i=$((i + 1))
+    done
+    [ -n "$next" ] || break
+    now=$(date +%s)
+    [ "${DUE[$next]}" -le "$now" ] || sleep $((DUE[next] - now))
+    attempt "$next" "$@"
+done
+
+# The exit status: a signal's, else the last failure's in the order given.
+rc=0 i=0
+while [ "$i" -lt "${#NAMES[@]}" ]; do
+    if [ "${FINISHED[$i]}" = 1 ]; then
+        :
+    elif [ "${TRIES[$i]}" = 0 ]; then
+        echo "[$(stamp)] ${NAMES[$i]:-$ONLY} not tried, since this run was stopped"
+    else
+        echo "[$(stamp)] ${NAMES[$i]:-$ONLY} not tried again, since this run was stopped"
+    fi
+    [ "${STATUS[$i]}" -eq 0 ] || rc="${STATUS[$i]}"
+    i=$((i + 1))
+done
+[ -z "$STOPPED" ] || rc="$STOPPED"
+
+elapsed=$(( $(date +%s) - started ))
+printf '[%s] archive-sync-cron finished exit=%d in %dm%02ds\n' \
+    "$(stamp)" "$rc" "$((elapsed / 60))" "$((elapsed % 60))"
+
+# Say out loud when a mirror has not actually succeeded in a while. A single
+# failed night is ordinary (a cluster down, a spent TOTP window); several in a
+# row means the archive is going stale, and this line is what says so. It
+# covers every configured backend, whether or not tonight's run touched it,
+# and one that has never succeeded as well.
+now=$(date +%s)
+checked=" "
+for backend in $BACKENDS $ONLY; do
+    case "$checked" in *" $backend "*) continue ;; esac
+    checked="$checked$backend "
+    file="$STATE_DIR/last-success-$backend"
+    if [ ! -f "$file" ]; then
+        echo "STALE: the $backend archive has no successful sync on record"
+        continue
+    fi
+    last="$(cat "$file" 2>/dev/null || true)"
+    case "$last" in
+        ''|*[!0-9]*)
+            echo "STALE: the $backend archive's success stamp is unreadable ($file)"
+            continue
+            ;;
+    esac
+    age=$(( (now - last) / 86400 ))
+    if [ "$age" -ge "$STALE_DAYS" ]; then
+        echo "STALE: the $backend archive last succeeded ${age}d ago" \
+             "— every run since then has failed"
+    fi
+done
+
+# Prune per-run rclone logs. Only these — the archive's own trash
+# (<dest>-trash/<timestamp>/ on the remote) is deliberately left alone.
+find "$STATE_DIR" -maxdepth 1 -type f -name 'sync-*.log' -mtime "+$KEEP_DAYS" \
+    -print -delete | sed 's/^/  pruned log: /'
+
+exit "$rc"

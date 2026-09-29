@@ -1,0 +1,46 @@
+# cluster-linger.service — keep remote tmux alive across a reboot of THIS machine.
+#
+# FASRC login nodes run logind with KillUserProcesses=yes: when the last session
+# an account has on a node ends, everything it still has running there is killed,
+# tmux server included. Rebooting this machine ends every session at once, so the
+# node's linger state at that one instant decides whether the work survives. The
+# watcher re-asserts linger every LINGER_INTERVAL seconds, which leaves a gap
+# the width of that interval; this unit closes it for any orderly shutdown.
+#
+# Why a unit and not just the watcher's SIGTERM handler: the watcher is a
+# detached process, so it is killed in systemd's final sweep — after the network
+# is down, when an assertion over SSH cannot reach the node. A
+# unit is ordered instead. `user@.service` is `After=systemd-user-sessions.service`,
+# which is `After=network.target`, and stop order is the reverse of start order,
+# so this user manager — and with it this ExecStop — is stopped while the
+# network is still up. That is the whole trick, and it is why this is a *user*
+# unit: nothing here needs root.
+#
+# Install: `cluster linger --install-hook` fills in the paths below and does
+# the rest (it prefers the system unit beside this one, where it can). By hand,
+# from the checkout, with `cluster` on PATH:
+#     sed -e "s#@CLUSTER@#$(command -v cluster)#g" -e "s#@REPO@#$PWD#g" \
+#         extras/cluster-linger.service > ~/.config/systemd/user/cluster-linger.service
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now cluster-linger.service
+#     loginctl enable-linger "$USER"   # so the user manager runs from boot
+#
+# `systemctl --user status cluster-linger` reads "active (exited)" when correct:
+# the unit does nothing at all until it is stopped. `cluster doctor` reports it.
+
+[Unit]
+Description=Keep cluster tmux sessions alive across a reboot of this machine
+Documentation=file:@REPO@/USAGE.md
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+# Leading '-': the assertion is best effort by nature — a node may be
+# unreachable or its logind wedged — and a shutdown must not be made to look
+# broken by it. `cluster linger` says so itself, in the journal.
+ExecStop=-@CLUSTER@ linger --quiet
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
