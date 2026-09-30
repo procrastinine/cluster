@@ -21,8 +21,8 @@ status, `k` kill-session, `ch` channels, `cp` transfer.
 ### Login names are global
 
 A login is one named SSH connection to one node of one backend. No two backends
-may have a login with the same name, and a login may not be named after a
-backend or an alias. A name is up to 32 characters of letters, digits, `.`, `_`
+may have a login with the same name, and a login may not be named `fasrc`,
+`nersc` or one of their aliases. A name is up to 32 characters of letters, digits, `.`, `_`
 and `-`, starting with a letter or digit, and two names that differ only in
 case are refused, because they would share files on a case-insensitive disk.
 A control socket's path is limited too (103 bytes on macOS, 107 on Linux); a
@@ -50,7 +50,9 @@ CLUSTER_BACKEND=nersc cluster login gpu
 
 The alias `fas` means `fasrc`, and `perlmutter` means `nersc`. A flag after
 `--` belongs to the remote command: `cluster run work -- echo --nersc` prints
-`--nersc`.
+`--nersc`. A [backend of your own](#a-backend-of-your-own) is named with
+`--backend NAME` or `CLUSTER_BACKEND` only: the short forms would take its name
+from every command line.
 
 Naming a backend that disagrees with where a login lives is an error. To resolve
 a clash, rename one login; the connection and its sessions carry over, so this
@@ -440,6 +442,61 @@ On FASRC, `cluster` answers the password and verification-code prompts itself.
 It stops answering once the session has started, so a `sudo` or `ssh` inside
 `cluster sh` prompts you as usual and never receives your cluster password.
 
+## A backend of your own
+
+Any other host ssh reaches can be a backend, with logins, tmux sessions, mounts,
+transfers and the watcher like the built-in ones:
+
+```bash
+cluster backends add lab lab-login     # a Host of your ssh config, a hostname, or user@host
+cluster --backend lab login work
+cluster backends                       # every backend, and its type
+cluster backends remove lab            # once it has no logins
+```
+
+`add` writes a section of `settings.ini`, which can equally be written by hand:
+
+```ini
+[lab]
+TYPE = ssh
+HOST = lab-login
+```
+
+Such a backend is named with `--backend lab`, `CLUSTER_BACKEND=lab` or
+`cluster config set BACKEND lab`. `lab:PATH` is not a prefix for it; a transfer
+names one of its logins instead (`work:~/data`). Its name is a lower-case
+letter followed by up to 23 letters, digits, `-` or `_`, and is refused if it
+would make a `CLUSTER_<NAME>_<KEY>` variable mean two things (`mount`, because
+of `MOUNT_NODES`).
+
+| | ssh backend |
+|---|---|
+| Authentication | ssh's own: keys, an agent, certificates, a jump host, as your ssh configuration says. Nothing is typed or saved by `cluster`. |
+| Prompts | A connection you make at a terminal (`login`, `attach`, `new`) may ask for a passphrase, a password or a new host key. One made with nobody there (a reconnect, the watcher, `boot`) runs in `BatchMode` and fails instead of waiting. |
+| A refusal | is recorded, and the unattended connections stop trying once it is confirmed, until you connect by hand or change `HOST` or the ssh configuration file ([below](#a-refused-credential-is-not-tried-again-elsewhere)). |
+| Nodes | A login is pinned to the name its node reports (`hostname -f`), which need not be `HOST`; reconnects go through `HOST`. |
+| Storage | Nothing is taken to be shared between nodes: `AUTO_MOUNT`, `ONE_MOUNT_PER_BACKEND` and `MOUNT_FAILOVER` are 0 for it. |
+
+Its settings, set with `cluster --backend lab config set KEY VALUE`:
+
+- `HOST`: where ssh connects.
+- `SSH_CONFIG`: the ssh configuration file; empty, the default, is ssh's own
+  (`~/.ssh/config`). The built-in backends use `/dev/null`.
+- `NODE_HOSTS`: for a `HOST` that can land on more than one machine,
+  `NODE=DESTINATION` pairs saying how to reach each (`NODE_HOSTS = n1=lab-n1
+  n2=lab-n2`). Without one, a reconnect that lands on another node is dropped
+  and says which pair to add, rather than adopt the wrong node. A command sent
+  to a node over a connection of its own checks first that it is there.
+- `REAPS_ON_LOGOUT` (0): set 1 if the host ends your processes when your last
+  session on it ends (logind's `KillUserProcesses`), so that `LINGER` keeps
+  tmux alive there as on FASRC.
+- `LABEL`: the name shown for it (empty: `HOST`). Every backend has this one.
+
+`cluster doctor` checks that the host ssh dials first answers, following a
+`ProxyJump` to its first hop and that hop's port; behind a `ProxyCommand`,
+only a connection can tell. A site that needs its own authentication or node
+layout needs a backend type written for it: [docs/backends.md](docs/backends.md).
+
 ## When something is slow or stops answering
 
 Work is never cut off for taking long. What ends something is evidence that the
@@ -530,7 +587,9 @@ credential: refused at 14:02 and 14:04; not retrying until the credentials chang
 ```
 
 On NERSC the record is sshproxy's, of the password: it holds a certificate
-fetch, never a connection made with a certificate that works.
+fetch, never a connection made with a certificate that works. On an [ssh
+backend](#a-backend-of-your-own) it is ssh's refusal, and "the credential files"
+are its `HOST` and its ssh configuration file.
 
 ### Commands that ride a connection never open their own
 
@@ -788,22 +847,22 @@ built-in value is used. `cluster config list` is the authoritative catalogue:
 | Mounts | `AUTO_MOUNT` (1), `ONE_MOUNT_PER_BACKEND` (1), `MOUNT_CHECK_TIMEOUT` (8), `MOUNT_BUSY_GRACE` (6), `MOUNT_FAILOVER` (1), `MOUNT_FAILOVER_AFTER` (2), `MOUNT_FAILOVER_TRIES` (3), `MOUNT_FAILBACK_TICKS` (20), `MOUNT_NODE_MAX_DSTATE` (200), `MOUNT_NODES` |
 | Watcher | `WATCH_INTERVAL` (30), `WATCH_RETRIES` (5), `WATCH_FAILURE_HALF_LIFE` (600), `WATCH_BACKOFF_MAX` (600), `WATCH_START_TIMEOUT` (3), `LAYOUT_INTERVAL` (300) |
 | Linger | `LINGER` (1), `LINGER_INTERVAL` (60), `LINGER_KEEPER` (0) |
-| Connections | `CONNECT_TIMEOUT` (25), `REMOTE_COMMAND_TIMEOUT` (60), `REMOTE_CHECK_TIMEOUT` (10), `SSH_SERVER_ALIVE_INTERVAL` (30), `SSH_SERVER_ALIVE_COUNT_MAX` (10), `EXTERNAL_SSH_SERVER_ALIVE_INTERVAL` (15), `EXTERNAL_SSH_SERVER_ALIVE_COUNT_MAX` (4), `POOL_OPEN_TRIES` (3), `MASTER_READY_WAIT` (6), `SSH_MAX_SESSIONS` (10), `INTERACTIVE_RETRIES` (8), `RECONNECT_DELAY` (2), `RECONNECT_DELAY_MAX` (60), `RECONNECT_HALF_LIFE` (300), `NODE_PROBE_TRIES` (3), `NODE_PROBE_TIMEOUT` (6), `REFRESH_TRIES` (5), `STOP_TIMEOUT` (5), `LOCK_PATIENCE` (30), `TOTP_LOCK_PATIENCE` (90), `REFUSAL_CONFIRM_DELAY` (90), `LIST_WORKERS` (8) |
+| Connections | `SSH_CONFIG` (`/dev/null`, so `~/.ssh/config` is ignored unless you point this at it; empty for an [ssh backend](#a-backend-of-your-own): ssh's own), `CONNECT_TIMEOUT` (25), `REMOTE_COMMAND_TIMEOUT` (60), `REMOTE_CHECK_TIMEOUT` (10), `SSH_SERVER_ALIVE_INTERVAL` (30), `SSH_SERVER_ALIVE_COUNT_MAX` (10), `EXTERNAL_SSH_SERVER_ALIVE_INTERVAL` (15), `EXTERNAL_SSH_SERVER_ALIVE_COUNT_MAX` (4), `POOL_OPEN_TRIES` (3), `MASTER_READY_WAIT` (6), `SSH_MAX_SESSIONS` (10), `INTERACTIVE_RETRIES` (8), `RECONNECT_DELAY` (2), `RECONNECT_DELAY_MAX` (60), `RECONNECT_HALF_LIFE` (300), `NODE_PROBE_TRIES` (3), `NODE_PROBE_TIMEOUT` (6), `REFRESH_TRIES` (5), `STOP_TIMEOUT` (5), `LOCK_PATIENCE` (30), `TOTP_LOCK_PATIENCE` (90), `REFUSAL_CONFIRM_DELAY` (90), `LIST_WORKERS` (8) |
 | Boot | `BOOT_WAIT` (180), `BOOT_TRIES` (5), `BOOT_RETRY_DELAY` (5), `BOOT_RETRY_DELAY_MAX` (30), `BOOT_NETWORK_POLL_INTERVAL` (1) |
 | Transfers | `TRANSFER_TRANSFERS` (4), `TRANSFER_CHECKERS` (3), `TRANSFER_CONNECTIONS` (0 = automatic), `TRANSFER_RETRIES` (2), `TRANSFER_RECONNECTS` (8), `TRANSFER_OPEN_TRIES` (3), `TRANSFER_IO_TIMEOUT` (120), `TRANSFER_PROBE_TIMEOUT` (45), `TRANSFER_PROBE_TRIES` (3), `TRANSFER_MULTI_THREAD_STREAMS` (1), `SHARED_TRANSFER_TRANSFERS` (2), `SHARED_TRANSFER_CHECKERS` (2), `RCLONE` (the first rclone 1.64 or newer found; see [docs/setup.md](docs/setup.md#rclone)), `REMOTE_RCLONE` (the one on the cluster's `PATH`), `GLOBUS_COLLECTION` (the backend's), `PEER_CONNECT_TIMEOUT` (20) |
 | NERSC | `CERT_RENEW_MARGIN` (3600), `SSHPROXY_TIMEOUT` (90), `NODE_REACH_TIMEOUT` (8), `NODE_REACH_SSH_TIMEOUT` (45), `NERSC_NODE_CANDIDATES` (6) |
 | Setup | `SETUP_REMOTE_TIMEOUT` (60), `SETUP_DRIFT_CHECK_INTERVAL` (86400), `SETUP_SYNC_NERSC_TOOL` (0), `VSCODE_TAB_TITLE` (0) |
 | Bridge | `BRIDGE_MIN_CERT_LEFT` (72000), `BRIDGE_LOGIN`, `BRIDGE_VERIFY_TIMEOUT` (300), `COMPANION_ADOPT_HUB_EDITS` (0), `COMPANION_SYNC_TIMEOUT` (60), `COMPANION_MAX_BYTES` (1048576) |
 | Doctor | `NTP_SERVER` (pool.ntp.org) |
-| Each backend's own | `CRED_DIR` (its credential directory), `NODES` (space-separated login nodes; replaces the backend's list everywhere, including completion) |
+| Each backend's own | `CRED_DIR` (its credential directory), `NODES` (space-separated login nodes; replaces the backend's list everywhere, including completion), `LABEL` (the name shown for it) |
+| ssh backends only | `HOST`, `NODE_HOSTS`, `REAPS_ON_LOGOUT` (0); see [A backend of your own](#a-backend-of-your-own) |
 | NERSC only | `KEY` (`~/.ssh/nersc`), `SCOPE` (the sshproxy scope, `default`), `COLLAB` (a collaboration account; empty is your own) |
 
 These apply to the whole tool and live in `[global]`: `BACKEND` (the only
-backend set up, else `fasrc`), `STATE_ROOT` (`~/.local/state/cluster`),
+backend set up, else `fasrc`; any backend, a [backend of your own](#a-backend-of-your-own) too), `STATE_ROOT` (`~/.local/state/cluster`),
 `CTL_DIR` (`~/.ssh/controlmasters`), `MOUNT_ROOT` (`~/cluster_mounts`),
 `CRED_ROOT` (`~/.config/cluster/credentials`), `VSCODE_SETTINGS` (empty: every
-VS Code installed here), `VSCODE_TAB_TITLE` (0), `SSH_CONFIG` (`/dev/null`, so
-`~/.ssh/config` is ignored unless you point this at it), `GLOBUS` (the Globus
+VS Code installed here), `VSCODE_TAB_TITLE` (0), `GLOBUS` (the Globus
 CLI), `FOREIGN_OWNER_OPTIONS` (empty; space-separated tmux user options that
 mark sessions another tool owns, which `clean` spares), and `FORCE_PORTABLE`
 (0; forces the fallbacks used where Linux-only interfaces such as `/proc` are

@@ -344,8 +344,19 @@ its place.
   `--keep` outlives its agent: the socket on the far side is present and answers
   nothing. A reused forwarding master is probed and replaced.
 - **`-F /dev/null` by default.** The tool is the single source of truth for how
-  it connects, so a stray `~/.ssh/config` stanza cannot change its behaviour.
-  `SSH_CONFIG` opts back in.
+  it connects to a site it knows, so a stray `~/.ssh/config` stanza cannot
+  change its behaviour. `SSH_CONFIG` opts back in. The ssh type is the
+  exception: it knows nothing about its host, so its `HOST` is usually a name in
+  that file, and it reads ssh's own configuration unless told otherwise. What
+  rides a master still gets `-F` with the machine-wide value, so a `Host *`
+  stanza's `RemoteCommand` or forwards never reach a shared master.
+- **A destination is not a node.** A login is pinned to what its node calls
+  itself, and every connection to it goes through the backend's `host_for`,
+  which for the ssh type is `HOST` or a `NODE_HOSTS` route, never the node's own
+  name: an alias, a jump or a port lives in ssh's configuration under the
+  destination. A reconnect that lands elsewhere is dropped, as on any backend,
+  and a command sent to a node over a connection of its own checks where it is
+  before it runs.
 - **A dead channel is not a dead master.** One channel can fail while the master
   is fine, so reconnect pings first and retries the channel. Tearing the master
   down unconditionally would cost a full reauthentication for nothing. Teardown and

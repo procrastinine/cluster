@@ -45,7 +45,8 @@ def _side(path, excluded=(), example="/good/path/...", name="nersc"):
         settings=types.SimpleNamespace(str=lambda key: ""),
         backend=types.SimpleNamespace(
             label="Test Cluster", globus_path_example=example,
-            globus_path_problem=problem, globus_collection=f"uuid-{name}"),
+            globus_path_problem=problem, globus_collection=f"uuid-{name}",
+            cli_flag=lambda: f"--{name}"),
     )
 
 

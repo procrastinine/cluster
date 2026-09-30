@@ -36,8 +36,9 @@ them together, says which optional parts work here, and offers the steps
 that go further. Nothing contacts a cluster or any other service unless you
 answer yes to a question that says it will; those questions default to no.
 
-With --fasrc or --nersc, only that cluster is set up. Answers may also be
-piped in, one per line, in the order the questions are asked.
+With --fasrc, --nersc or --backend NAME, only that cluster is set up.
+Answers may also be piped in, one per line, in the order the questions are
+asked. A host of your own is added with `cluster backends add NAME HOST`.
 """
     argparse.ArgumentParser(prog="cluster init", add_help=False).parse_args(args)
     missing = _this_machine()
@@ -144,9 +145,11 @@ def _credentials(name):
     cls = backends.BACKENDS[name]
     settings = config.Settings(name)
     ui.say("")
-    if not cls.missing_credentials(settings):
-        if not ui.ask_yes(f"{name} is set up as {cls.local_username(settings)}; "
-                          "go through its credentials again?", default=False):
+    if cls.is_configured(settings) and not cls.missing_credentials(settings):
+        question = (f"{name} is set up as {cls.local_username(settings)}; go "
+                    "through its credentials again?" if cls.CREDENTIALS else
+                    f"{name} is set up; go through its settings again?")
+        if not ui.ask_yes(question, default=False):
             return
     configcmd.enroll(name)
 
@@ -233,10 +236,10 @@ def _test_login(name):
     from ..auth import explain_failure
     from ..context import Context
 
-    cls = backends.BACKENDS[name]
-    if not ui.ask_yes(f"Try logging in to {cls.label} now? This connects, types "
-                      "your password and a code, and uses up the current "
-                      "30-second window of codes.", default=False):
+    # The backend alone for the question: its context is made only on a yes.
+    shown = backends.load(name)
+    if not ui.ask_yes(f"Try logging in to {shown.label} now? This connects, "
+                      f"{shown.login_cost}.", default=False):
         return True
     ctx = Context(name, explicit=True)
     backend = ctx.backend
@@ -263,7 +266,8 @@ def _test_login(name):
     for index, line in enumerate(lines):
         if line.strip() == MARKER:
             node = lines[index + 1].strip() if index + 1 < len(lines) else "?"
-            ui.info(f"logged in to {node} as {backend.user}")
+            ui.info(f"logged in to {node}"
+                    + (f" as {backend.user}" if backend.user else ""))
             return True
     # Under a pty (a password backend) both streams hold the one transcript.
     said = lines + ([] if proc.stderr == proc.stdout
@@ -285,11 +289,12 @@ def _further(names, missing):
             continue
         cls = backends.BACKENDS[name]
         # A test login runs ssh; a new certificate is read with ssh-keygen.
-        tool, step = (("ssh", "a test login") if cls.interactive_auth
+        login = cls.first_check == "login"
+        tool, step = (("ssh", "a test login") if login
                       else ("ssh-keygen", "a certificate"))
         if tool in missing:
             ui.say(f"{cls.label}: {step} needs {tool}, which is not installed")
-        elif cls.interactive_auth:
+        elif login:
             worked = _test_login(name) and worked
         else:
             worked = _fetch_credential(name) and worked

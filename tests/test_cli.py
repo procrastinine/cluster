@@ -693,7 +693,9 @@ class TestTransferCommandLine(unittest.TestCase):
             backend=SimpleNamespace(name="nersc", user="user",
                                     fqdn=lambda n: n, transfer_nodes=lambda: [],
                                     node_choosable=False,
-                                    host_for=lambda _node: "dtn.example.gov"),
+                                    host_for=lambda _node: "dtn.example.gov",
+                                    target=lambda _node=None: "user@dtn.example.gov",
+                                    cli_flag=lambda: "--nersc"),
             state=SimpleNamespace(xfer_socket=lambda tag: P(f"/tmp/{tag}.sock")),
             settings=SimpleNamespace(int=lambda _key: 30))
         out, err = io.StringIO(), io.StringIO()

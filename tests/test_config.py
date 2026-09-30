@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from support import _IsolatedMachine, _patched  # noqa: E402
 from clustertool import config  # noqa: E402
-from clustertool.backends import BACKENDS  # noqa: E402
+from clustertool.backends import BACKENDS, TYPES  # noqa: E402
 from clustertool.config import Settings  # noqa: E402
 
 
@@ -151,7 +151,7 @@ class TestSettingsAreDeclaredOnce(unittest.TestCase):
 
         usage = (REPO_ROOT / "USAGE.md").read_text()
         keys = set(self.config.SHARED) | set(self.config.GLOBAL) | set(self.config.RELAY)
-        for cls in BACKENDS.values():
+        for cls in TYPES.values():
             keys |= set(cls.SETTINGS)
         missing = sorted(key for key in keys
                          if not re.search(r"`[^`\n]*\b%s\b[^`\n]*`" % key, usage))

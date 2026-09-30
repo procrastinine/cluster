@@ -16,7 +16,9 @@ from .base import InteractiveTotpBackend, resolve_cred_dir
 
 
 class FasrcBackend(InteractiveTotpBackend):
-    name = "fasrc"
+    name = type_name = "fasrc"
+    aliases = ("fas",)
+    shorthand = True
     label = "Harvard FASRC"
     node_domain = "rc.fas.harvard.edu"
     pool_host = "login.rc.fas.harvard.edu"

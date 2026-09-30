@@ -145,9 +145,10 @@ class Endpoint:
 def split_endpoint(token):
     """``fasrc:~/x`` -> ("fasrc", "~/x"); anything unqualified -> (None, token).
 
-    A backend name, one of its aliases, or a *login* name all name a cluster —
-    login names are a global namespace, so ``main:~/x`` is as unambiguous as
-    ``fasrc:~/x``. ``local:`` and ``remote:`` keep their existing meaning, and a
+    A built-in backend's name, one of its aliases, or a *login* name all name
+    a cluster — login names are a global namespace, so ``main:~/x`` is as
+    unambiguous as ``fasrc:~/x``, and it is how a backend of your own is
+    named here. ``local:`` and ``remote:`` keep their existing meaning, and a
     plain ``host:path`` or a drive letter is left alone rather than half-parsed.
     """
     if ":" not in token:
@@ -155,7 +156,7 @@ def split_endpoint(token):
     head, rest = token.split(":", 1)
     if head in ("local", "remote"):
         return None, token
-    key = backends.as_backend(head)
+    key = backends.as_shorthand(head)
     if key:
         return key, rest
     owner = registry.find(head)  # local state only: no network, no auth
@@ -408,7 +409,7 @@ class CrossTransfer:
                 f"transfer connection {tag} forwards an agent that is gone, and "
                 "another run still uses the connection",
                 "its forwarding cannot be replaced while it is open",
-                f"once that run is done: cluster --{executor.name} transfer "
+                f"once that run is done: cluster {executor.backend.cli_flag()} transfer "
                 f"--close {tag}")
         tag = xfer.open_connection(node=self.executor_node, quiet=self.quiet,
                                    forward_agent=True, agent_env=agent.env())
@@ -463,7 +464,7 @@ class CrossTransfer:
                 "-o", f"ConnectTimeout={settings.int('PEER_CONNECT_TIMEOUT')}",
                 "-o", f"ServerAliveInterval={settings.int('SSH_SERVER_ALIVE_INTERVAL')}",
                 "-o", f"ServerAliveCountMax={settings.int('SSH_SERVER_ALIVE_COUNT_MAX')}",
-                f"{peer.backend.user}@{host}"]
+                f"{peer.backend.user}@{host}" if peer.backend.user else host]
 
     def _peer_candidates(self, peer):
         """Hosts on the peer worth trying, best first.
@@ -640,7 +641,7 @@ class CrossTransfer:
             f"{executor.backend.label}",
             "; ".join(seen) or "no rclone found there at all",
             "load a module providing one, then: cluster "
-            f"--{executor.name} config set REMOTE_RCLONE /path/to/rclone",
+            f"{executor.backend.cli_flag()} config set REMOTE_RCLONE /path/to/rclone",
         )
 
     # --- relay --------------------------------------------------------------

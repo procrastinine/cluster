@@ -1,7 +1,7 @@
 # Contributing
 
 Bug reports and pull requests are welcome. This file covers the layout of the
-source, how to run the tests, and how to add a backend for another site.
+source, how to run the tests, and how to add a backend type for another site.
 
 ## Ground rules
 
@@ -37,7 +37,7 @@ bin/cluster                  entry point; runs from the checkout
 bin/cluster-relay            laptop client that forwards to the machine running cluster
 bin/nersc                    runs remote/nersc in place on this machine
 clustertool/                 the package
-clustertool/backends/        one module per site, plus the interface in base.py
+clustertool/backends/        one module per type (ssh and each site), the interface in base.py
 clustertool/commands/        user-facing command handlers, grouped by concern
 remote/nersc                 the single-file NERSC companion (Python 3.6)
 remote/hooks.example.py      an example project hooks file for the companion
@@ -147,85 +147,54 @@ spends a 30-second TOTP window, and repeated failures can lock an account.
 
 ## Adding a backend
 
-A backend declares what the rest of the tool refuses to guess: how to prove who
-you are, which hosts exist and which are reachable, how to address one node,
-and which quirks the site imposes. Read `clustertool/backends/base.py`, then
-`fasrc.py` and `nersc.py` as the two worked examples.
+A host ssh already reaches needs no code: `cluster backends add NAME HOST`
+makes a profile of the `ssh` type ([USAGE.md](USAGE.md#a-backend-of-your-own)).
+A site that needs the tool to authenticate for it, or has a node layout of its
+own, needs a type: a subclass of `Backend` whose hooks answer what the rest of
+the tool refuses to guess. [docs/backends.md](docs/backends.md) maps the hooks
+and shows a type kept in a file of one's own; `fasrc.py`, `nersc.py` and
+`ssh.py` are the worked examples. To ship one with the tool:
 
-1. **Create `clustertool/backends/<site>.py`** with a subclass:
+1. **Create `clustertool/backends/<site>.py`** with the subclass:
 
-   - Subclass `InteractiveTotpBackend` if the site asks for a password and TOTP
-     code on every connection. It answers the prompts under a pty and paces
-     authentications one per TOTP window (`paces_totp = True`).
-   - Subclass `Backend` directly for key or certificate authentication, as
-     `NerscBackend` does. Implement `identity_opts()`, and for a cached
-     credential, `credential_state()`, `ensure_credential()` and
-     `drop_credential()`.
+   - `InteractiveTotpBackend` if the site asks for a password and TOTP code on
+     every connection. It answers the prompts under a pty and paces
+     authentications one per TOTP window.
+   - `Backend` for key or certificate authentication, as `NerscBackend` does,
+     with `identity_opts()` and, for a cached credential,
+     `credential_state()`, `ensure_credential()` and `drop_credential()`.
+   - `SshBackend` for a site ssh authenticates to by itself.
 
-2. **Declare identity and topology:**
+2. **Name it.** `name = type_name = "<site>"` makes it one site's type with a
+   built-in profile of that name, which has the short forms `--<site>` and
+   `<site>:PATH`; set `shorthand = True`, and `aliases` for other spellings. A
+   login may not be named after either, so choose aliases with care. The name
+   is also the settings section, the state directory and the word in
+   `CLUSTER_<NAME>_*` variables.
 
-   - `name` (the key used in flags, prefixes, state paths, settings sections and
-     `CLUSTER_<NAME>_*` variables), `label`, `pool_host` and `node_domain`.
-   - `node_classes`: a tuple of `NodeClass` entries from `clustertool/nodes.py`,
-     each with `routable`, `purposes` (`LOGIN`, `TRANSFER`, `MOUNT`, `BATCH`),
-     and either `hosts` or a `template` and `count`, plus a `note` shown by
-     `cluster nodes`. The `NODES` setting replaces the login list at run time.
-   - For firewalled nodes, mark the class `routable=False` and implement
-     `jump_opts(node)`; override `node_probe_host()` and `node_reachable()` if a
-     TCP probe cannot tell you anything.
-   - `node_choosable`: `True` if picking a node is free (then override
-     `node_candidates_for()`), `False` if the balancer must choose.
-   - `mount_via`: `"login"` to mount over the login's own master, or
-     `"mount_node"` to use a dedicated `MOUNT` node.
-   - `home_remote()`: the path to mount, if the home is not the login shell's
-     current directory.
+3. **Declare topology** (`node_classes`, `pool_host`, `node_domain`,
+   `node_choosable`, `mount_via`), **settings and credentials** (`SETTINGS`,
+   `CREDENTIALS`, `enroll_hint`, `enroll_settings`) and **site behaviour**
+   (`reaps_on_logout`, the Globus attributes, a credential to lend). Firewalled
+   nodes are a class with `routable=False` and a `jump_opts(node)`.
 
-3. **Declare its settings and credentials:**
-
-   - `SETTINGS`: `Backend.SETTINGS` (`CRED_DIR`, `NODES`) plus a `Setting` for
-     each value only this site reads, with its built-in value and a one-line
-     meaning. `cluster config set` writes these to the backend's own section,
-     refuses them for another backend, and `cluster config list` shows them.
-   - `CREDENTIALS`: what `cluster init` and `cluster config credentials` ask
-     for, in order. The default, username, password and TOTP seed, suits most
-     sites; each `Credential` names its file in the credential directory, the
-     keys `cluster config set` knows it by, and how a typed value is checked.
-   - `enroll_hint`: the site notes printed before those questions. Say where
-     each answer comes from: which account the username and password belong
-     to, and where the site shows a TOTP token's seed.
-   - `enroll_settings`: settings asked for along with the credentials, such as
-     NERSC's `COLLAB`.
-
-4. **Declare site behaviour:**
-
-   - `reaps_on_logout`: `True` if the site's logind kills a user's processes
-     when the last session ends. This enables the linger machinery, which
-     `LINGER` (on by default) controls.
-   - `lends_credential`, `agent_identities()` and `agent_identity_seconds()`: set
-     these if the credential is a file that can be lent to another cluster for
-     direct transfers.
-   - `globus_collection`, `globus_session_domain`, `globus_excluded_paths` and
-     `globus_path_example` if the site has a Globus collection.
-
-5. **In `__init__`,** call `super().__init__(settings)`, set `self.cred_dir =
+4. **In `__init__`,** call `super().__init__(settings)`, set `self.cred_dir =
    resolve_cred_dir(self.name, self.settings)`, and set `self.user =
    self._require_username()`, which reads the `user` file or
    `CLUSTER_<NAME>_USER` and otherwise says how to set the site up.
 
-6. **Register it:** add the class to `BACKENDS` in
-   `clustertool/backends/__init__.py`, and any aliases to `ALIASES`. A login may
-   not be named after a backend or an alias, so choose aliases with care.
-   Flags, prefixes, settings sections and `BACKEND` validation all read the
-   registry. The top-level help in `clustertool/cli.py` names the backends and
-   aliases in prose, so update it too, then run
+5. **Register it** in `TYPES` in `clustertool/backends/__init__.py`. Flags,
+   prefixes, settings sections, `BACKEND` validation and completion all read
+   the registry. The top-level help in `clustertool/cli.py` names the built-in
+   backends in prose, so update it too, then run
    `bin/cluster _complete-data --update`.
 
-7. **If the site needs a local tool the others do not,** add a row for it to
+6. **If the site needs a local tool the others do not,** add a row for it to
    `feature_rows()` in `clustertool/diagnostics.py`. `cluster doctor` and
    `cluster init` both show those rows, so a row that is off must say what to
    install, on Linux and on macOS.
 
-8. **Add tests** to `tests/test_backends.py` for anything the backend decides:
+7. **Add tests** to `tests/test_backends.py` for anything the backend decides:
    node candidates, jump options, credential state, path exclusions.
 
 Features that assume two particular sites stay with those sites: the NERSC

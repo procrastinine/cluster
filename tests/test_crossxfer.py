@@ -281,6 +281,8 @@ def _endpoint(name, path, settings):
     backend = types.SimpleNamespace(
         name=name, label=name.upper(), user="user",
         host_for=lambda node: node or f"{name}.example",
+        target=lambda node=None: f"user@{node or name + '.example'}",
+        cli_flag=lambda: f"--{name}",
         inbound_transfer_host=lambda: f"dtn01.{name}.example",
         short=lambda node: (node or "").split(".")[0])
     return types.SimpleNamespace(name=name, path=path, backend=backend,
@@ -476,7 +478,8 @@ class TestRelayConfig(unittest.TestCase):
     @staticmethod
     def side(user, host):
         return types.SimpleNamespace(
-            backend=types.SimpleNamespace(user=user, host_for=lambda node: host),
+            backend=types.SimpleNamespace(user=user, host_for=lambda node: host,
+                                          target=lambda node=None: f"{user}@{host}"),
             settings=_settings())
 
     def test_one_sftp_remote_per_cluster_with_its_own_transport(self):
@@ -679,7 +682,8 @@ class TestReusedForwardingMaster(unittest.TestCase):
             is_active=lambda tag: reused, open_connection=open_connection,
             close_connection=close_connection, lease_drop=seen.dropped.append)
         executor = types.SimpleNamespace(
-            name="fasrc", backend=types.SimpleNamespace(short=lambda n: n),
+            name="fasrc", backend=types.SimpleNamespace(short=lambda n: n,
+                                                        cli_flag=lambda: "--fasrc"),
             settings=Settings("fasrc"),
             state=types.SimpleNamespace(xfer_socket=lambda tag: Path(f"/x/{tag}.sock")))
         cross = _cross(executor, None)

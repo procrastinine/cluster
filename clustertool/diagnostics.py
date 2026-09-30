@@ -90,7 +90,7 @@ def where(ctx, name):
 
 def status(ctx):
     backend = ctx.backend
-    ui.say(ui.bold(f"{backend.label} — {backend.user}"))
+    ui.say(ui.bold(f"{backend.label} — {backend.user or backend.target()}"))
     state, detail = backend.credential_state()
     mark = {"ok": ui.green, "ready": ui.green, "expiring": ui.yellow,
             "missing": ui.red}[state]
@@ -98,7 +98,7 @@ def status(ctx):
     refused = ctx.state.refusals.status()
     if refused:
         ui.say(f"credential: {ui.red(refused)}")
-        ui.note(f"check it with: cluster --{backend.name} config credentials")
+        ui.note(f"check it with: {backend.credentials_command()}")
 
     names = ctx.state.known_logins()
     live_logins = []
@@ -824,6 +824,8 @@ def credential_checks(backend, report):
     state, detail = backend.credential_state()
     report.check("credential", state != "missing", detail,
                  fatal=(state == "missing"))
+    if backend.cred_dir is None:
+        return      # it keeps none: ssh's own configuration says how
     cred_dir = Path(backend.cred_dir)
     # The directory matters as much as the files: a group-writable one lets
     # someone else swap your password file out from under you, and 600 files
@@ -848,6 +850,13 @@ def credential_checks(backend, report):
                         ", ".join(others) + f"; this tool reads only {', '.join(known)}")
 
 
+def _resolves(backend, node):
+    """Whether the host ssh dials first for *node* resolves; true when no
+    probe from here can tell (Backend.node_probe_host)."""
+    probe = backend.node_probe_host(node)
+    return probe is None or plat.dns_ok(probe[0])
+
+
 def backend_checks(ctx, report):
     """Health of one backend that is set up on this machine."""
     backend = ctx.backend
@@ -862,13 +871,19 @@ def backend_checks(ctx, report):
     report.check("clock sync", ok, detail, fatal=fatal)
 
     report.section("\nnetwork")
-    report.check(f"resolve {backend.pool_host}", plat.dns_ok(backend.pool_host))
-    report.check(f"reach {backend.pool_host}:22",
-                 plat.tcp_open(backend.pool_host, 22, 8), fatal=False)
+    reach = backend.reach_host()
+    if reach is None:
+        report.check(f"reach {backend.pool_host}", True,
+                     "through a proxy command; only a connection can tell")
+    else:
+        host, port = reach
+        report.check(f"resolve {host}", plat.dns_ok(host))
+        report.check(f"reach {host}:{port}", plat.tcp_open(host, port, 8),
+                     fatal=False)
     for node_class in backend.node_classes:
         if node_class.routable:
             members = node_class.members()
-            reachable = sum(1 for m in members[:4] if plat.dns_ok(m))
+            reachable = sum(1 for m in members[:4] if _resolves(backend, m))
             report.check(f"{node_class.name} nodes resolve",
                          reachable > 0, f"{reachable}/{min(4, len(members))} sampled",
                          fatal=False)

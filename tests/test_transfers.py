@@ -198,6 +198,8 @@ class TransferHarness(unittest.TestCase):
         backend = types.SimpleNamespace(
             name="fake", user="u", short=lambda n: (n or "").split(".")[0],
             host_for=lambda n: n or "host", transfer_nodes=lambda: [],
+            target=lambda n=None: f"u@{n or 'host'}", cli_flag=lambda: "--fake",
+            credentials_command=lambda: "cluster --fake config credentials",
             node_choosable=False,
         )
         values = values or {}
@@ -1090,7 +1092,8 @@ class TestTransferCommandLine(unittest.TestCase):
         state.ctl_dir.mkdir(parents=True, exist_ok=True)
         backend = types.SimpleNamespace(
             name="fake", user="u", fqdn=lambda n: n,
-            host_for=lambda n: n or "host", short=lambda n: (n or "").split(".")[0])
+            host_for=lambda n: n or "host", short=lambda n: (n or "").split(".")[0],
+            target=lambda n=None: f"u@{n or 'host'}", cli_flag=lambda: "--fake")
         ctx = types.SimpleNamespace(
             backend=backend, explicit_backend=False,
             logins=types.SimpleNamespace(
@@ -1252,7 +1255,8 @@ class TestPullOntoACaseFoldingDisk(unittest.TestCase):
                 run_remote=lambda name, cmd, timeout=None: (
                     ran.append(cmd), listing)[1]),
             state=types.SimpleNamespace(socket=lambda n: Path("/nonexistent/s")),
-            backend=types.SimpleNamespace(user="user", host_for=lambda n: n),
+            backend=types.SimpleNamespace(user="user", host_for=lambda n: n,
+                                          target=lambda n=None: f"user@{n}"),
             settings=types.SimpleNamespace(int=lambda k: 4))
         rsynced = []
         with _patched(plat, "IS_MAC", True), \

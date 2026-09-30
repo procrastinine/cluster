@@ -402,7 +402,7 @@ class Mounts:
         # without the program name, and splits each -o at its commas, which
         # NO_CONNECTION_OF_ITS_OWN has none of.
         argv += rider_argv(sock, options=["-o", "BatchMode=yes"])[1:]
-        argv.append(f"{self.backend.user}@{self.backend.host_for(target_node)}:{remote}")
+        argv.append(f"{self.backend.target(target_node)}:{remote}")
         argv.append(str(mp))
 
         proc = plat.run(argv, timeout=90)

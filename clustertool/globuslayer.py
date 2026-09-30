@@ -121,7 +121,8 @@ def collection_for(endpoint):
         return declared
     ui.die(
         f"no Globus collection known for {endpoint.backend.label}",
-        f"set its UUID: cluster --{endpoint.name} config set GLOBUS_COLLECTION <uuid>",
+        f"set its UUID: cluster {endpoint.backend.cli_flag()} config set "
+        "GLOBUS_COLLECTION <uuid>",
         "  (find candidates with: globus endpoint search <site>)",
     )
 

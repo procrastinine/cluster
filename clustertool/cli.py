@@ -9,9 +9,10 @@ guessed at — as a login *and a session*, so a typo would create a session
 named after the typo. Say the verb: ``cluster attach main``. Short aliases
 (``a``, ``w``, ``n``, ...) keep that cheap to type.
 
-A backend is named per invocation as a ``--nersc``-style flag anywhere on the
-line, as a prefix on the verb (``cluster nersc:ls``), with ``--backend NAME``,
-or via CLUSTER_BACKEND — so day-to-day use never has to repeat it.
+A backend is named per invocation with ``--backend NAME`` or CLUSTER_BACKEND,
+and a built-in one also as a ``--nersc``-style flag anywhere on the line or a
+prefix on the verb (``cluster nersc:ls``) — so day-to-day use never has to
+repeat it.
 
 The commands themselves live in :mod:`clustertool.commands`; importing a module
 there registers its commands.
@@ -37,13 +38,12 @@ COMMAND_MODULES = (init, configure, connections, maintenance, mounts, sessions,
 
 
 def split_backend_prefix(token):
-    """``nersc:main`` -> ('nersc', 'main')."""
+    """``nersc:main`` -> ('nersc', 'main'): a built-in backend's short form."""
     if token and ":" in token:
         head, _, tail = token.partition(":")
-        try:
-            return backends.resolve_name(head), tail
-        except SystemExit:
-            return None, token
+        name = backends.as_shorthand(head)
+        if name:
+            return name, tail
     return None, token
 
 
@@ -70,8 +70,13 @@ commands like ls/status to one cluster. Shortest first; all four are equivalent:
   CLUSTER_BACKEND=nersc cluster login gpu
 
 The default is fasrc, or the only backend set up on this machine (BACKEND
-changes it). Aliases: --fas = fasrc, --perlmutter = nersc. A backend name or
-alias cannot also be a login name.
+changes it). Aliases: --fas = fasrc, --perlmutter = nersc. These names and
+aliases cannot also be login names.
+
+Any other host ssh reaches is a backend of your own, named with --backend:
+
+  cluster backends add lab lab-login     a Host of your ssh config, a hostname,
+  cluster --backend lab login work       or user@host
 
 Commands (short alias in parentheses):
 """
@@ -218,6 +223,9 @@ def print_usage(stream=None):
 def strip_backend_flag(argv):
     """Pull a `--nersc` / `--fasrc` shorthand out of anywhere in *argv*.
 
+    Only a built-in backend has one: any other is named by its user, and a
+    `--NAME` taken from every command line would take options from them.
+
     `--backend nersc` is the long form, and it has to come first; naming the
     cluster as a flag is what people actually reach for, and it reads best where
     the thought ends: `cluster login gpu --nersc`. So it is accepted anywhere —
@@ -230,7 +238,7 @@ def strip_backend_flag(argv):
     found, kept = None, []
     for index, token in enumerate(argv):
         if index < limit and token.startswith("--") and len(token) > 2:
-            name = backends.as_backend(token[2:])
+            name = backends.as_shorthand(token[2:])
             if name:
                 found = name
                 continue
@@ -270,10 +278,12 @@ def completion_data():
     from .configcmd import credential_keys
     from .nodes import LOGIN
 
-    names = sorted(backends.BACKENDS)
+    # The built-in backends only: a profile is this machine's, and the
+    # completion reads those from settings.ini as it runs.
+    names = sorted(backends.BUILTIN)
     logins, fixed = [], []
     for name in names:
-        cls = backends.BACKENDS[name]
+        cls = backends.BUILTIN[name]
         login_class = next((node_class for node_class in cls.node_classes
                             if node_class.serves(LOGIN)), None)
         if login_class:
@@ -289,7 +299,8 @@ def completion_data():
         f"_CLUSTER_BACKEND_WORDS='{' '.join(names + sorted(backends.ALIASES))}'",
         f"_CLUSTER_DEFAULT_BACKEND='{config.GLOBAL_DEFAULTS['BACKEND']}'",
     ]
-    lines += _wrapped(config.known_keys(), "_CLUSTER_SETTINGS='", "    ", end="'")
+    lines += _wrapped(config.known_keys(classes=backends.TYPES.values()),
+                      "_CLUSTER_SETTINGS='", "    ", end="'")
     lines += _wrapped(credential_keys(), "_CLUSTER_CREDENTIALS='", "    ", end="'")
     lines.append("")
     lines += _shell_case("_cluster_alias", "", [

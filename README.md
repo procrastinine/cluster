@@ -6,7 +6,8 @@ The goal of the `cluster` tool is to make working on HPC clusters less of a head
 - Can optionally mount cluster home directories over SSHFS for quick viewing/editing of files on clusters
 - Auto-heals stuff, auto reconnects
 - Easy file transfers to and from the cluster (again without authentication each time)
-- It currently supports the two clusters I use, Harvard FASRC (`fasrc`) and NERSC Perlmutter (`nersc`)
+- I tried to make it as painless as possible, with niceties like tab autocompletions and making the tmux friendly for AI agents
+- There is very careful support for the two clusters I use, Harvard FASRC (`fasrc`) and NERSC Perlmutter (`nersc`), including specifics for the login nodes, TOTP retry times, limits, etc. You can also use your own clusters by writing configs.
 
 I currently use it on my free Oracle Cloud VPS (always online and no stupid disconnects), although it should work with macOS as well. For me personally, it has replaced manual SSH logins because it is so much more convenient.
 

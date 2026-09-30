@@ -276,7 +276,7 @@ cfg_is_set() {
     [ -n "${!own+x}" ] || [ -n "${!all+x}" ]
 }
 
-valid_backend() { case "$1" in ''|[!a-z]*|*[!a-z0-9]*) return 1 ;; esac; return 0; }
+valid_backend() { case "$1" in ''|[!a-z]*|*[!a-z0-9_-]*) return 1 ;; esac; return 0; }
 
 # <REMOTE><backend>-home, with a separator only where REMOTE lacks one.
 join_remote() {

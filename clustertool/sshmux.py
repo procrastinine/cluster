@@ -636,7 +636,7 @@ class Logins:
                     last_error or "no error output",
                     *(["that is the credential failing, which every node would "
                        "repeat, so the other nodes were not tried"] if more else []),
-                    f"check it with: cluster --{self.backend.name} config credentials",
+                    f"check it with: {self.backend.credentials_command()}",
                     f"master log: {log}",
                 )
             if node is not None and not quiet:
@@ -678,7 +678,7 @@ class Logins:
             ui.die(
                 f"login '{name}' is pinned to {self.backend.short(pinned)} but landed on "
                 f"{self.backend.short(landed)}; dropped that connection",
-                "retry, or repin deliberately if the sessions really moved",
+                *self.backend.pin_hint(pinned, landed),
             )
 
         # A new connection is the first chance to protect whatever will run on
@@ -744,7 +744,7 @@ class Logins:
         tries = max(1, tries)
         opened, detail = False, ""
         self.held = ""
-        recorded = self.backend.interactive_auth
+        recorded = self.backend.records_refusals
         refusals = self.state.refusals
         attempt, replaced = 1, False
         while True:
@@ -797,8 +797,7 @@ class Logins:
         why = self._refusal_hold(claim)
         if why:
             ui.die(f"not authenticating to {where}", why,
-                   f"check them with: cluster --{self.backend.name} config "
-                   "credentials",
+                   f"check them with: {self.backend.credentials_command()}",
                    "try them now with: cluster login NAME")
 
     def authenticate_directly(self, where, run, required=False):
@@ -818,7 +817,7 @@ class Logins:
         no TOTP window could be had, as last_failure says. With *required*,
         either dies instead.
         """
-        recorded = self.backend.interactive_auth
+        recorded = self.backend.records_refusals
         self.last_failure = self.held = ""
 
         def held(claim=True):

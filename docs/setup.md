@@ -47,6 +47,19 @@ and otherwise the first connection that needs one does. One fetch runs at a
 time on this machine, each in a TOTP window no other fetch has used, and a
 command that waited for another's fetch uses the certificate it brought.
 
+### Any other host
+
+A host that ssh already reaches, with keys, an agent or a jump host configured
+in `~/.ssh/config`, needs nothing saved here:
+
+```bash
+cluster backends add lab lab-login      # a Host of your ssh config, a hostname, or user@host
+cluster --backend lab init              # offers a test login
+```
+
+Connections to it authenticate as ssh does on its own; see
+[A backend of your own](../USAGE.md#a-backend-of-your-own).
+
 ### What a TOTP seed looks like
 
 The seed is base32 text: letters A to Z and digits 2 to 7, with any spaces or

@@ -38,6 +38,10 @@ class TestStatusRoundTrips(unittest.TestCase):
             return "ok", "ready"
 
         @staticmethod
+        def credentials_command():
+            return "cluster --example config credentials"
+
+        @staticmethod
         def short(node):
             return (node or "").split(".")[0]
 

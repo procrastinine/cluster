@@ -41,7 +41,7 @@ class TestDisposableShell(unittest.TestCase):
 
         class Backend:
             settings = Settings("fasrc")
-            paces_totp = interactive_auth = False
+            paces_totp = interactive_auth = records_refusals = False
             pool_host = "example"
 
             def ensure_credential(self):
@@ -246,7 +246,8 @@ class TestBootRecovery(unittest.TestCase):
         logins = SimpleNamespace(last_failure=last_failure, node_of=lambda _n: "node")
         logins.ensure = lambda name: ensure(logins, name)
         ctx = SimpleNamespace(
-            backend=SimpleNamespace(pool_host="pool.example", short=lambda n: n),
+            backend=SimpleNamespace(pool_host="pool.example", short=lambda n: n,
+                                    reach_host=lambda: ("pool.example", 22)),
             login=lambda name: name, settings=Settings(backend), logins=logins,
             mounts=SimpleNamespace(
                 start_watcher=lambda name: self.watched.append(name) or True))

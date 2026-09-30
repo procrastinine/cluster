@@ -37,15 +37,38 @@ and never displayed.
 
 
 @command("backends", needs_context=False,
-         help="List known cluster backends and credential state")
+         help="List the backends and their credential state; add or remove one")
 def cmd_backends(invocation, args):
-    """Every backend the tool knows, including ones not set up yet.
+    """Usage: cluster backends [add NAME [HOST] [--type TYPE] [--label TEXT] | remove NAME]
 
-    Needs no backend of its own, so it answers on a machine where none is
-    configured — which is exactly when someone asks it what there is. A
-    credential the cluster refused shows as refused (state.Refusals), read
-    where it is kept, so listing makes no state.
-    """
+Every backend the tool knows, including ones not set up yet: the built-in
+fasrc and nersc, and each profile of the settings file. `add` makes a profile
+of any host ssh reaches, a section of settings.ini like
+
+    [lab]
+    TYPE = ssh
+    HOST = lab-login
+
+where HOST is a Host of your ssh config, a hostname or user@host. It is then
+named with --backend NAME. TYPE is ssh unless --type names another: the path
+of a Python file defining one (docs/backends.md). `remove` deletes the section
+of a backend that has no logins.
+"""
+    if args and args[0] == "add":
+        return _add_backend(_add_parser().parse_args(args[1:]))
+    if args and args[0] in ("remove", "rm"):
+        return _remove_backend(args[1:])
+    if args:
+        ui.die(f"unknown backends subcommand '{args[0]}'",
+               "usage: cluster backends [add NAME [HOST] | remove NAME]")
+    return _list_backends()
+
+
+def _list_backends():
+    """The table. Needs no backend of its own, so it answers on a machine
+    where none is configured — which is exactly when someone asks it what
+    there is. A credential the cluster refused shows as refused
+    (state.Refusals), read where it is kept, so listing makes no state."""
     from ..state import Refusals
 
     rows = []
@@ -53,15 +76,102 @@ def cmd_backends(invocation, args):
         try:
             backend = cls(config.Settings(name))
         except backends.BackendUnavailable:
-            rows.append([name, cls.label, "-", "missing",
-                         f"not set up: cluster --{name} config credentials"])
+            rows.append([name, cls.type_name, cls.label, "-", "missing",
+                         f"not set up: {cls.setup_command()}"])
             continue
         state, detail = backend.credential_state()
         refused = Refusals(backend, config.STATE_ROOT / name).status()
         if refused:
             state, detail = "refused", refused
-        rows.append([backend.name, backend.label, backend.user, state, detail])
-    ui.table(rows, ["BACKEND", "CLUSTER", "USER", "CRED", "DETAIL"])
+        rows.append([backend.name, cls.type_name, backend.label,
+                     backend.user or "-", state, detail])
+    ui.table(rows, ["BACKEND", "TYPE", "CLUSTER", "USER", "CRED", "DETAIL"])
+    if all(cls.shorthand for cls in backends.BACKENDS.values()):
+        ui.note("any other host ssh reaches: cluster backends add NAME HOST")
+    return 0
+
+
+def _add_parser():
+    parser = argparse.ArgumentParser(prog="cluster backends add")
+    parser.add_argument("name")
+    parser.add_argument("host", nargs="?", default="",
+                        help="a Host of your ssh config, a hostname, or user@host")
+    parser.add_argument("--type", default="ssh", dest="kind", metavar="TYPE",
+                        help="add: ssh, or the path of a Python file defining a type")
+    parser.add_argument("--label", default="", help="add: the name shown for it")
+    return parser
+
+
+def _add_backend(opts):
+    name = opts.name
+    if name in backends.BACKENDS:
+        ui.die(f"backend '{name}' already exists",
+               f"change it with: cluster {backends.flag(name)} config set KEY VALUE")
+    problem = backends.profile_name_problem(name, list(backends.BACKENDS))
+    if problem:
+        ui.die(f"'{name}' cannot name a backend: {problem}")
+    try:
+        kind = backends._type(opts.kind)
+    except ValueError as exc:
+        ui.die(str(exc))
+    values = [("HOST", opts.host), ("LABEL", opts.label)]
+    for key, value in values:
+        if not value:
+            continue
+        if key not in kind.SETTINGS:
+            ui.die(f"a {kind.type_name} backend has no {key}")
+        try:
+            kind.SETTINGS[key].parse(value)
+        except ValueError as exc:
+            ui.die(f"{key} {value!r}: {exc}")
+    where = config.SETTINGS_FILE
+    try:
+        config.write_entry(name, "TYPE", opts.kind.strip())
+        for key, value in values:
+            if value:
+                config.write_value(key, value, backend=name)
+    except ValueError as exc:
+        ui.die(str(exc), "the malformed file was left untouched")
+    ui.info(f"added backend '{name}' ({kind.type_name}) as [{name}] of {where}")
+    cls = backends.BACKENDS[name]
+    if not cls.is_configured(config.Settings(name)):
+        ui.note(f"it is not set up yet: {cls.setup_command()}")
+        return 0
+    from ..configcmd import say_steps
+
+    say_steps(list(cls.setup_steps()) + [
+        (f"cluster {cls.cli_flag()} new work",
+         "open a connection and a tmux session called work")])
+    return 0
+
+
+def _remove_backend(args):
+    from .. import registry
+
+    if len(args) != 1:
+        ui.die("usage: cluster backends remove NAME")
+    name = args[0]
+    cls = backends.BACKENDS.get(name)
+    if cls is None:
+        ui.die(f"no backend '{name}'")
+    if cls.shorthand:
+        ui.die(f"'{name}' is built in; there is nothing to remove",
+               f"its settings go with: cluster {cls.cli_flag()} config unset KEY")
+    logins = registry.logins_of(name)
+    if logins:
+        ui.die(f"backend '{name}' has logins: {', '.join(logins)}",
+               "their sessions would be left where nothing looks at them",
+               f"close them first: cluster {cls.cli_flag()} close --all")
+    try:
+        for section, entry in config.file_entries():
+            if section == name:
+                config.remove_entry(section, entry)
+    except ValueError as exc:
+        ui.die(str(exc), "the malformed file was left untouched")
+    ui.info(f"removed backend '{name}' from {config.SETTINGS_FILE}")
+    state = config.STATE_ROOT / name
+    if state.exists():
+        ui.note(f"its logs and records stay in {state}")
     return 0
 
 
@@ -83,11 +193,19 @@ def cmd_nodes(invocation, args):
             ",".join(sorted(node_class.purposes)),
             shown,
         ])
-    ui.table(rows, ["CLASS", "REACH", "PURPOSES", "MEMBERS"])
+    if rows:
+        ui.table(rows, ["CLASS", "REACH", "PURPOSES", "MEMBERS"])
+    else:
+        ui.say("no node list: a login is pinned to the node its connection "
+               "lands on")
     for node_class in node_classes:
         if node_class.note:
             ui.say(f"\n{node_class.name}: {node_class.note}")
-    ui.say(f"\npool address: {backend.pool_host}")
+    try:
+        pool = backend(config.Settings(name)).pool_host
+    except backends.BackendUnavailable:
+        pool = backend.pool_host
+    ui.say(f"\npool address: {pool or '-'}")
     return 0
 
 

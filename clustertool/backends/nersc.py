@@ -48,7 +48,9 @@ CODE_MIN_LEFT = 3
 
 
 class NerscBackend(Backend):
-    name = "nersc"
+    name = type_name = "nersc"
+    aliases = ("perlmutter",)
+    shorthand = True
     label = "NERSC Perlmutter"
     node_domain = "chn.perlmutter.nersc.gov"
     pool_host = "perlmutter.nersc.gov"
@@ -88,6 +90,8 @@ class NerscBackend(Backend):
     interactive_auth = False
     paces_totp = False
     node_choosable = True
+    #: Connections present a certificate, so what init offers is fetching one.
+    first_check = "credential"
     #: An sshproxy certificate is a file, so it can be lent to another cluster's
     #: ssh through a forwarded agent — which is what makes a direct
     #: cluster-to-cluster transfer possible with NERSC as the far side.
@@ -211,10 +215,10 @@ class NerscBackend(Backend):
         missing = self.missing_credentials(self.settings)
         if missing:
             return state, (f"{detail}; a new one needs the {' and '.join(missing)}: "
-                           f"cluster --{self.name} config credentials")
+                           f"cluster {self.cli_flag()} config credentials")
         if state == CRED_MISSING:
             return CRED_READY, (f"{detail}; one is fetched on first use, or now "
-                                f"with `cluster --{self.name} auth`")
+                                f"with `cluster {self.cli_flag()} auth`")
         return state, detail
 
     def ensure_credential(self, force=False, quiet=False):
@@ -268,7 +272,7 @@ class NerscBackend(Backend):
             if not quiet:
                 ui.warn(f"NERSC refused a certificate fetched to replace a refused "
                         f"one ({detail}); not fetching another")
-                ui.note(f"fetch one by hand with: cluster --{self.name} auth")
+                ui.note(f"fetch one by hand with: cluster {self.cli_flag()} auth")
             return False
         if not quiet:
             ui.warn(f"NERSC refused the certificate ({detail}); fetching a fresh one")
@@ -287,6 +291,11 @@ class NerscBackend(Backend):
             (config.state_dir(self.name) / "certificate.refused").unlink()
         except OSError:
             pass
+
+    @classmethod
+    def setup_steps(cls):
+        return [(f"cluster {cls.cli_flag()} auth",
+                 "fetch a certificate now (uses one TOTP code)")]
 
     def refusal_holds_connections(self):
         """A refusal on record is sshproxy's, of the password: it holds a
@@ -328,7 +337,7 @@ class NerscBackend(Backend):
         if seen is None:
             seen = self.cert_mark()
         need = self.renew_margin if min_left is None else min_left
-        fix = f"\n  set it with: cluster --{self.name} config credentials"
+        fix = f"\n  set it with: cluster {self.cli_flag()} config credentials"
         try:
             password = self.read_credential(PASSWORD)
             secret = self.read_credential(TOTP_SEED)
@@ -374,7 +383,7 @@ class NerscBackend(Backend):
                 if why:
                     raise SystemExit(f"cluster: not asking sshproxy for a "
                                      f"certificate: {why}{fix}\n  or fetch one "
-                                     f"by hand: cluster --{self.name} auth")
+                                     f"by hand: cluster {self.cli_flag()} auth")
 
             # Before the wait for a TOTP window, and again once it is had.
             gate(claim=False)
@@ -597,7 +606,7 @@ class NerscBackend(Backend):
         if not node or node == self.pool_host or self.nodes.routable(node):
             return []
         inner = (
-            ["ssh", "-F", config.global_value("SSH_CONFIG", "/dev/null")]
+            ["ssh", "-F", self.settings.str("SSH_CONFIG")]
             + self.identity_opts()
             + [
                 "-o", "BatchMode=yes",

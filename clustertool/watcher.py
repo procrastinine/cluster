@@ -297,8 +297,8 @@ class Watcher:
         why = self.state.refusals.blocks(claim=False) if holds else ""
         if why != self._refused:
             if why:
-                self.log(f"not reconnecting: {why}; check them with: cluster "
-                         f"--{self.logins.backend.name} config credentials")
+                self.log(f"not reconnecting: {why}; check them with: "
+                         f"{self.logins.backend.credentials_command()}")
             elif not holds:
                 self.log("a reconnect needs nothing that was refused; "
                          "reconnecting")

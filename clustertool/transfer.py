@@ -177,7 +177,7 @@ def channel_ssh(backend, settings, sock, node=None):
     (BatchMode=yes): with the master gone it fails, rather than authenticate
     behind the caller's back.
     """
-    return rider_argv(sock, f"{backend.user}@{backend.host_for(node)}", [
+    return rider_argv(sock, backend.target(node), [
         "-o", "BatchMode=yes",
         "-o", "ServerAliveInterval="
               f"{settings.int('EXTERNAL_SSH_SERVER_ALIVE_INTERVAL')}",
@@ -954,8 +954,7 @@ class Transfers:
             if attempt < len(schedule):
                 hints.append("that is the credential failing, which every node "
                              "would repeat, so no other node was tried")
-            hints.append("check it with: cluster "
-                         f"--{self.backend.name} config credentials")
+            hints.append(f"check it with: {self.backend.credentials_command()}")
         ui.die("could not open a transfer connection "
                + (f"on {', '.join(nodes)}" if nodes else
                   f"after {attempt} attempt(s)"),

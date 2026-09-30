@@ -114,7 +114,7 @@ def _rsync_file(ctx, name, local, remote_rel):
     node = ctx.logins.node_of(name)
     remote_shell = " ".join(shlex.quote(p) for p in sshmux.rider_argv(
         sock, options=["-o", "BatchMode=yes"]))
-    host = f"{ctx.backend.user}@{ctx.backend.host_for(node)}"
+    host = ctx.backend.target(node)
     parent, _, base = remote_rel.rpartition("/")
     tmp = f"{parent}/.{base}.bridge-tmp" if parent else f".{base}.bridge-tmp"
     idle = ctx.settings.int("TRANSFER_IO_TIMEOUT")
@@ -439,7 +439,7 @@ def push_cron(ctx, force=False):
                 ui.note(f"that is the {backend_name} credential failing, which "
                         f"every {backend_name} login would repeat, so no other "
                         f"is tried; check it with: "
-                        f"cluster --{backend_name} config credentials")
+                        f"{backends.BACKENDS[backend_name].setup_command()}")
             else:
                 ui.warn(f"bridge push via '{login}' failed; trying the next login")
         ui.warn(f"bridge push failed on every login tried ({', '.join(tried)})")

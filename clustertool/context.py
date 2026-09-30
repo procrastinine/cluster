@@ -101,7 +101,8 @@ class Context:
             ui.die(
                 f"login '{name}' is on {owner}, not {self.backend.name}",
                 "login names are global: one name is one connection",
-                f"drop the flag (names resolve on their own), or say --{owner}",
+                f"drop the flag (names resolve on their own), or say "
+                f"{backends.flag(owner)}",
             )
         self._bind(owner)
         return name

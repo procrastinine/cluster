@@ -192,10 +192,13 @@ def cmd_boot(ctx, args):
     # will not open is: it goes on trying, with backoff, until it comes.
     deadline = time.monotonic() + wait
     announced = False
-    while not plat.dns_ok(ctx.backend.pool_host):
+    # What must resolve first: the pool address, or the first host a jump
+    # goes through. None: a proxy command, which only connecting can test.
+    reach = ctx.backend.reach_host()
+    while reach and not plat.dns_ok(reach[0]):
         if time.monotonic() >= deadline:
             return _leave_to_watcher(
-                ctx, name, f"no route to {ctx.backend.pool_host} after {wait}s")
+                ctx, name, f"no route to {reach[0]} after {wait}s")
         if not announced:
             ui.info(f"waiting for the network (up to {wait}s)")
             announced = True

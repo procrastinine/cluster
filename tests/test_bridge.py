@@ -136,7 +136,8 @@ class TestBridge(unittest.TestCase):
     RSYNC_CTX = SimpleNamespace(
         state=SimpleNamespace(socket=lambda name: Path("/tmp/cl-fasrc-work.sock")),
         logins=SimpleNamespace(node_of=lambda name: "login01"),
-        backend=SimpleNamespace(user="user", host_for=lambda node: node + ".example"),
+        backend=SimpleNamespace(user="user",
+                                target=lambda node: f"user@{node}.example"),
         settings=SimpleNamespace(int=lambda key: {"TRANSFER_IO_TIMEOUT": 77}[key]),
     )
 

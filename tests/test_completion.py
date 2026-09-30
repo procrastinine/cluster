@@ -259,6 +259,18 @@ class TestBashCompletion(unittest.TestCase):
         self.assertNotIn("holylogin05", nersc)
         self.assertIn("holylogin05", self.complete("--fasrc", "rescue", ""))
 
+    def test_a_backend_of_your_own_is_named_with_backend_only(self):
+        config = self.root / ".config" / "cluster"
+        config.mkdir(parents=True)
+        (config / "settings.ini").write_text(
+            "[my-lab]\nTYPE = ssh\nHOST = lab-login\nNODE_HOSTS = n1=a n2=b\n")
+        self.assertIn("my-lab", self.complete("--backend", ""))
+        self.assertIn("my-lab", self.complete("transfer", "--executor", ""))
+        self.assertNotIn("--my-lab", self.complete("--"))
+        self.assertEqual(self.complete("--backend", "my-lab", "rescue", ""), {"n1", "n2"})
+        self.assertEqual(self.complete("backends", ""), {"add", "remove"})
+        self.assertEqual(self.complete("backends", "remove", ""), {"my-lab"})
+
     def test_a_filename_with_a_space_is_one_reply(self):
         folder = self.root / "files"
         folder.mkdir()
@@ -388,8 +400,10 @@ class TestBashCompletion(unittest.TestCase):
         from clustertool import config
         from clustertool.configcmd import credential_keys
 
+        from clustertool.backends import TYPES
+
         offered = self.complete("config", "get", "")
-        settable = set(config.known_keys())
+        settable = set(config.known_keys(classes=TYPES.values()))
         self.assertEqual(settable - offered, set())
         self.assertEqual(offered - settable - set(credential_keys()), set())
 

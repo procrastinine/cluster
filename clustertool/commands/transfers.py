@@ -157,7 +157,7 @@ def cmd_ssh_command(ctx, args):
         if not opts.quiet:
             ui.info(f"{'reusing' if tag in already_open else 'opened'} "
                     f"transfer connection {tag}")
-            ui.note(f"close it when done: cluster --{ctx.backend.name} "
+            ui.note(f"close it when done: cluster {ctx.backend.cli_flag()} "
                     f"transfer --close {tag}")
     else:
         name = ctx.login(opts.login)

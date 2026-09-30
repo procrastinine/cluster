@@ -139,6 +139,6 @@ def borrow(backend):
     missing = [path for path in identities if not os.path.isfile(str(path))]
     if missing:
         ui.die(f"{backend.label} identity is missing: {missing[0]}",
-               f"run: cluster --{backend.name} auth")
+               f"run: cluster {backend.cli_flag()} auth")
     return ScopedAgent(identities, lifetime=backend.agent_identity_seconds(),
                        label=backend.name)

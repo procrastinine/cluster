@@ -73,7 +73,11 @@ def _status(name, field):
 
 
 def credential_table(names):
-    """Print each backend's credentials: values of plain ones, secrets as set or missing."""
+    """Print each backend's credentials: values of plain ones, secrets as set
+    or missing. A backend that keeps none (ssh's own) has no row."""
+    names = [name for name in names if _class(name).CREDENTIALS]
+    if not names:
+        return
     fields = []
     for name in names:
         fields += [field for field in _class(name).CREDENTIALS if field not in fields]
@@ -234,13 +238,10 @@ def enroll(name):
 
 def next_steps(name):
     """``[(command, what it does)]`` to try once backend *name* is set up."""
-    steps = []
-    if not _class(name).interactive_auth:
-        steps.append((f"cluster --{name} auth",
-                      "fetch a certificate now (uses one TOTP code)"))
-    steps.append((f"cluster --{name} new work",
-                  "open a connection and a tmux session called work"))
-    return steps
+    cls = _class(name)
+    return list(cls.setup_steps()) + [
+        (f"cluster {cls.cli_flag()} new work",
+         "open a connection and a tmux session called work")]
 
 
 def say_steps(steps):
@@ -265,7 +266,8 @@ def choose_backend(question="Which cluster"):
         except EOFError:
             ui.die("no cluster was named; nothing was changed",
                    "name one with a flag: " + " or ".join(
-                       f"cluster --{name} config credentials" for name in names))
+                       f"cluster {backends.flag(name)} config credentials"
+                       for name in names))
         chosen = backends.as_backend(typed)
         if chosen:
             return chosen
@@ -279,10 +281,15 @@ def _credentials(invocation):
     enroll(name)
     ui.say("")
     credential_table([name])
-    missing = _class(name).missing_credentials(config.Settings(name))
+    cls, settings = _class(name), config.Settings(name)
+    missing = cls.missing_credentials(settings)
     if missing:
         ui.say("")
         ui.say(f"still missing: {_listed(missing)}")
+        return 1
+    if not cls.is_configured(settings):
+        ui.say("")
+        ui.say(f"not set up yet: {cls.setup_command()}")
         return 1
     ui.say("")
     say_steps(next_steps(name))
@@ -331,7 +338,7 @@ def _owner(invocation, key, writing, force_global=False):
         return None
     owners = config.owners(key)
     if owners:
-        flags = " or ".join(f"cluster --{owner} config set {key} VALUE"
+        flags = " or ".join(f"cluster {backends.flag(owner)} config set {key} VALUE"
                             for owner in owners)
         if force_global:
             ui.die(f"{key} is read only by {', '.join(owners)}, so it cannot be "
@@ -376,8 +383,8 @@ def _show(invocation, show_all=False):
     ui.say(f"settings file: {config.SETTINGS_FILE}")
     if backend:
         ui.say(f"backend: {backend}" + ("" if backends.configured(backend) else
-                                        f" (not set up: cluster --{backend} "
-                                        "config credentials)"))
+                                        " (not set up: "
+                                        f"{_class(backend).setup_command()})"))
     else:
         ui.say("no cluster is set up on this machine yet: run `cluster init`")
     if rows:
@@ -424,12 +431,14 @@ def _set_credential(name, field, value):
         if value is not None:
             ui.die(f"refusing a {field.label} on the command line",
                    "it would remain in shell history and the process list",
-                   f"run: cluster --{name} config set {field.keys[0].lower()}")
+                   f"run: cluster {backends.flag(name)} config set "
+                   f"{field.keys[0].lower()}")
         prompt = field.label[:1].upper() + field.label[1:]
         value = _typed_secret(f"{prompt}{f' ({field.hint})' if field.hint else ''}: ")
     elif value is None:
         ui.die(f"the {field.label} needs a value",
-               f"run: cluster --{name} config set {field.keys[0].lower()} VALUE")
+               f"run: cluster {backends.flag(name)} config set "
+               f"{field.keys[0].lower()} VALUE")
     try:
         value = field.clean(value)
     except ValueError as exc:
@@ -483,7 +492,7 @@ def _unset(invocation, key, force_global=False):
         if path.exists():
             ui.die(f"refusing to delete {path} through config unset",
                    "credentials are deleted by hand, deliberately",
-                   f"to change it: cluster --{name} config credentials")
+                   f"to change it: cluster {backends.flag(name)} config credentials")
         ui.say(f"the {field.label} is already missing")
         return 0
     if key in config.known_keys():
@@ -510,7 +519,8 @@ def _unset(invocation, key, force_global=False):
         elsewhere = [other for other in _in_file(key) if other != section]
         if elsewhere:
             ui.note("it is set in " + ", ".join(f"[{other}]" for other in elsewhere)
-                    + (f"; to remove it: cluster --{elsewhere[0]} config unset {key}"
+                    + (f"; to remove it: cluster {backends.flag(elsewhere[0])} "
+                       f"config unset {key}"
                        if elsewhere[0] in backends.BACKENDS else ""))
     return 0
 

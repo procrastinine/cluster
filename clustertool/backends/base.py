@@ -1,11 +1,16 @@
-"""The backend interface.
+"""The backend interface: the hooks a backend type fills in.
 
 A backend knows four things the rest of the tool refuses to guess: how to prove
 who you are, which hosts exist and which of them are reachable, how to address
 one specific node, and which local quirks the remote software imposes.
 
 Everything else — logins, pins, tmux, mounts, transfers, the watcher — is
-written once against this interface.
+written once against this interface, and never names a site. A type is a
+subclass of :class:`Backend` that overrides what its site needs: the built-in
+ones are ``ssh`` (any host ssh reaches, see ssh.py), ``fasrc`` and ``nersc``,
+and a profile's TYPE may name a file of your own that defines one (see
+docs/backends.md). Each hook below says what it answers and what the default
+does.
 """
 
 from __future__ import annotations
@@ -164,13 +169,31 @@ class Backend:
     SETTINGS = {
         "CRED_DIR": Setting("", "credential directory override for this backend"),
         "NODES": Setting("", "space-separated login-node override for this backend"),
+        "LABEL": Setting("", "the name shown for this backend (empty: its type's)"),
     }
 
     # --- identity -----------------------------------------------------------
+    #: The profile: the settings section, state directory and credential
+    #: directory are all named after it.
     name = ""
     label = ""
     user = ""
     cred_dir = None
+
+    #: The type this class implements, as a profile's TYPE names it.
+    type_name = ""
+    #: Other names the profile answers to (--fas, fas:path). Built-in profiles
+    #: only: each is a word taken from every command line.
+    aliases = ()
+    #: Whether the profile has the short forms --NAME and NAME:path, which
+    #: only the built-in ones do. Any other is named with --backend NAME.
+    shorthand = False
+
+    @classmethod
+    def cli_flag(cls):
+        """How a command line names this profile: ``--nersc``, or
+        ``--backend lab`` for one without the short form."""
+        return f"--{cls.name}" if cls.shorthand else f"--backend {cls.name}"
 
     #: What `cluster init` and `cluster config credentials` ask for, in order.
     CREDENTIALS = CREDENTIALS
@@ -178,6 +201,12 @@ class Backend:
     #: Settings they also offer, with the credentials: optional per-account
     #: answers such as a collaboration account.
     enroll_settings = ()
+
+    #: What `cluster init` offers once the credentials are in: "login", one
+    #: throwaway connection (which costs what login_cost says), or
+    #: "credential", fetching the credential the connections present.
+    first_check = "login"
+    login_cost = ""
 
     #: Where the answers come from, said before asking for them.
     enroll_hint = ()
@@ -208,6 +237,12 @@ class Backend:
     #: nothing for `cluster setup` to install on it.
     companion_drives = False
 
+    #: A refused credential goes on the shared record (state.Refusals), which
+    #: then holds unattended connections until a person connects by hand:
+    #: where each connection presents a password, or where only a person can
+    #: tell what ssh wants.
+    records_refusals = False
+
     #: declared node classes; see clustertool.nodes. An instance's own copy
     #: carries the NODES setting, if any: see configured_node_classes.
     node_classes = ()
@@ -220,6 +255,7 @@ class Backend:
 
     def __init__(self, settings):
         self.settings = settings
+        self.label = settings.str("LABEL") or type(self).label
         self.node_classes = self.configured_node_classes(settings)
         self.nodes = NodeMap(self.node_classes)
 
@@ -251,6 +287,28 @@ class Backend:
 
     # --- identity -----------------------------------------------------------
     @classmethod
+    def is_configured(cls, settings):
+        """Whether this machine knows enough to use the backend. Local files
+        only, and never raises: by default, a username."""
+        return bool(cls.local_username(settings))
+
+    @classmethod
+    def setup_command(cls):
+        """The command that sets this backend up, for a message saying it is not."""
+        return f"cluster {cls.cli_flag()} config credentials"
+
+    def credentials_command(self):
+        """The command that checks what the connections present, for a
+        message about a refusal."""
+        return f"cluster {self.cli_flag()} config credentials"
+
+    @classmethod
+    def setup_steps(cls):
+        """``[(command, what it does)]`` worth doing once the backend is set
+        up, before its first login."""
+        return []
+
+    @classmethod
     def local_username(cls, settings):
         """The username this machine has for *cls*, or ``""``. Never raises.
 
@@ -258,7 +316,8 @@ class Backend:
         directory: local configuration only, so it answers "is this backend
         set up here" for every backend without constructing any of them.
         """
-        explicit = os.environ.get(f"CLUSTER_{cls.name.upper()}_USER", "").strip()
+        explicit = os.environ.get(f"CLUSTER_{config.env_word(cls.name)}_USER",
+                                  "").strip()
         if explicit:
             return explicit
         path = resolve_cred_dir(cls.name, settings) / USERNAME.filename
@@ -295,7 +354,7 @@ class Backend:
             raise BackendUnavailable(
                 self.name, f"{self.label} ({self.name}) is not set up on this "
                 "machine: its username is unknown",
-                f"set it up with: cluster --{self.name} config credentials")
+                f"set it up with: {self.setup_command()}")
         return user
 
     # --- credentials --------------------------------------------------------
@@ -328,7 +387,7 @@ class Backend:
     def refusal_holds_connections(self):
         """Whether a refusal on the shared record (state.Refusals) holds this
         backend's connections: where each presents the password, it does."""
-        return self.interactive_auth
+        return self.records_refusals
 
     def credential_marks(self):
         """What tells the credential presented from any other, without reading
@@ -412,15 +471,14 @@ class Backend:
     # --- ssh ----------------------------------------------------------------
     def common_opts(self, forward_agent=False):
         # -F /dev/null by default: this tool is the single source of truth for
-        # how it connects, so a stray ~/.ssh/config stanza can never change its
-        # behaviour. CLUSTER_SSH_CONFIG opts back in.
+        # how it connects to a site, so a stray ~/.ssh/config stanza can never
+        # change its behaviour. SSH_CONFIG opts back in.
         #
         # ForwardAgent is a parameter rather than something a caller appends,
         # because ssh takes the *first* value it is given for an option: a
         # trailing "-o ForwardAgent=yes" after this list is silently ignored.
-        ssh_config = config.global_value("SSH_CONFIG", "/dev/null")
         return [
-            "-F", ssh_config,
+            "-F", self.settings.str("SSH_CONFIG"),
             "-o", f"User={self.user}",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"ForwardAgent={'yes' if forward_agent else 'no'}",
@@ -438,11 +496,23 @@ class Backend:
         return []
 
     def host_for(self, node=None):
-        """The hostname ssh should connect to."""
+        """Where ssh connects to reach *node*: the destination, which need not
+        be the name the node answers to. A login is pinned to the name its
+        node reports (``hostname -f``), and every connection to it goes
+        through here, so the two may differ. None is "wherever the pool
+        address lands"."""
         return node or self.pool_host
 
     def target(self, node=None):
-        return f"{self.user}@{self.host_for(node)}"
+        """ssh's destination argument for *node*: ``user@host``, or the host
+        alone when the username is left to ssh's own configuration."""
+        host = self.host_for(node)
+        return f"{self.user}@{host}" if self.user else host
+
+    def pin_hint(self, pinned, landed):
+        """What to tell someone whose login, pinned to *pinned*, landed on
+        *landed* instead: lines after the fact itself."""
+        return ["retry, or repin deliberately if the sessions really moved"]
 
     def ssh_opts(self, node=None, sock=None, master=False, persist=None,
                  forward_agent=False):
@@ -544,12 +614,22 @@ class Backend:
         return [None]
 
     def node_probe_host(self, node):
-        """Host/port to probe when checking whether a node is usable."""
+        """Host/port to probe when checking whether a node is usable, or None
+        when no TCP probe from here can tell (a node behind a proxy)."""
         return self.host_for(node), 22
+
+    def reach_host(self):
+        """(host, port) whose name resolving says the network is up, and whose
+        port answering says the site is reachable, for `doctor` and `boot`;
+        None when this machine cannot tell without connecting."""
+        return self.pool_host, 22
 
     def node_reachable(self, node, tries=None):
         tries = tries or self.settings.int("NODE_PROBE_TRIES")
-        host, port = self.node_probe_host(node)
+        probe = self.node_probe_host(node)
+        if probe is None:
+            return True     # only a connection can tell; let it
+        host, port = probe
         for _ in range(max(1, tries)):
             if plat.tcp_open(host, port,
                              timeout=self.settings.int("NODE_PROBE_TIMEOUT")):
@@ -583,6 +663,9 @@ class InteractiveTotpBackend(Backend):
 
     interactive_auth = True
     paces_totp = True
+    records_refusals = True
+    login_cost = ("types your password and a code, and uses up the current "
+                  "30-second window of codes")
 
     def _password(self):
         return self.read_credential(PASSWORD)
@@ -606,6 +689,5 @@ class InteractiveTotpBackend(Backend):
         except PermissionError as exc:
             return CRED_MISSING, str(exc)
         except (OSError, ValueError) as exc:
-            return CRED_MISSING, (f"{exc}; set it with: "
-                                  f"cluster --{self.name} config credentials")
+            return CRED_MISSING, f"{exc}; set it with: {self.setup_command()}"
         return CRED_OK, "password + TOTP per connection"

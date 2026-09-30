@@ -135,8 +135,6 @@ GLOBAL = {
                                    "the launch command", flag=True),
     "CRED_ROOT": Setting(str(CONFIG_ROOT / "credentials"),
                          "private credential directory root", required=True),
-    "SSH_CONFIG": Setting("/dev/null", "OpenSSH config file; /dev/null isolates "
-                                       "cluster settings", required=True),
     "GLOBUS": Setting("", "Globus CLI executable override"),
     "FOREIGN_OWNER_OPTIONS": Setting("", "tmux owner options set by other tools; "
                                          "their sessions are never swept"),
@@ -190,6 +188,11 @@ SHARED = {
                               choices=("tmux", "shell")),
     # capacity
     "MAX_LOGINS": Setting(5, "maximum managed connections per backend"),
+    # connecting: /dev/null keeps a stray ~/.ssh/config stanza from changing
+    # how the tool reaches a site whose type knows how (the ssh type reads
+    # ssh's own configuration instead: its HOST is usually a name there).
+    "SSH_CONFIG": Setting("/dev/null", "OpenSSH config file; /dev/null isolates "
+                                       "cluster settings", required=True),
     # mounting
     "AUTO_MOUNT": Setting(1, "automatically mount before interactive work", flag=True),
     # Every login node of a backend serves the same home filesystem, so a second
@@ -418,6 +421,11 @@ def normalize_key(key):
     return str(key).strip().replace("-", "_").upper()
 
 
+def env_word(backend):
+    """*backend* as a word of CLUSTER_<BACKEND>_<KEY>: ``my-lab`` -> ``MY_LAB``."""
+    return backend.upper().replace("-", "_")
+
+
 def _backend_classes():
     from .backends import BACKENDS
 
@@ -437,12 +445,12 @@ def lookup(key, backend=None):
     """The :class:`Setting` for *key*, as *backend* reads it. KeyError if none.
 
     With no backend, a backend-only key is described by the first backend
-    that declares it.
+    that declares it. A backend's own declaration of a shared key is its
+    type's default for it (the ssh type mounts nothing unasked).
     """
     key = normalize_key(key)
-    for table in (_MACHINE, SHARED):
-        if key in table:
-            return table[key]
+    if key in _MACHINE:
+        return _MACHINE[key]
     classes = _backend_classes()
     if backend:
         # A backend the registry does not know reads what every backend reads.
@@ -451,16 +459,20 @@ def lookup(key, backend=None):
         declared = getattr(classes.get(backend), "SETTINGS", Backend.SETTINGS)
         if key in declared:
             return declared[key]
+    if key in SHARED:
+        return SHARED[key]
+    if backend:
         raise KeyError(key)
     for name in owners(key):
         return classes[name].SETTINGS[key]
     raise KeyError(key)
 
 
-def known_keys(include_global=True):
-    """Every setting name, sorted: shared, backend-only, and machine-wide."""
+def known_keys(include_global=True, classes=None):
+    """Every setting name, sorted: shared, backend-only, and machine-wide.
+    Backend-only ones are those of *classes*, by default every backend's."""
     keys = set(SHARED)
-    for cls in _backend_classes().values():
+    for cls in _backend_classes().values() if classes is None else classes:
         keys.update(cls.SETTINGS)
     if include_global:
         keys.update(_MACHINE)
@@ -613,7 +625,8 @@ def unread_entries(path=None):
     nothing reads.
 
     A section is read only under its exact name: [global], [relay], or a
-    backend's; a name is read in any case.
+    backend's; a name is read in any case. TYPE is read in the section of a
+    profile that is not built in (clustertool.backends).
     """
     classes = _backend_classes()
     parser = _read_file(path)
@@ -625,7 +638,8 @@ def unread_entries(path=None):
         elif section == "global":
             read = key in GLOBAL or key in SHARED or bool(owners(key))
         elif section in classes:
-            read = key in SHARED or key in classes[section].SETTINGS
+            read = (key in SHARED or key in classes[section].SETTINGS
+                    or (key == "TYPE" and not classes[section].shorthand))
         else:
             read = False
         if not read:
@@ -652,7 +666,7 @@ def _environment(key, backend):
     section, name = _stored_as(key)
     names = [f"CLUSTER_{section.upper()}_{name}"] if section else []
     if backend and not section and key not in GLOBAL:
-        names.append(f"CLUSTER_{backend.upper()}_{key}")
+        names.append(f"CLUSTER_{env_word(backend)}_{key}")
     if not section:
         names.append(f"CLUSTER_{key}")
     for variable in names:
@@ -838,6 +852,12 @@ def unset_value(key, backend=None, path=None):
     """
     key = normalize_key(key)
     return _change_file(path, section_for(key, backend), _stored_as(key)[1], None)
+
+
+def write_entry(section, name, value, path=None):
+    """Write *name* in *section* as it is, for an entry no setting declares
+    (a profile's TYPE, which says which settings its section has)."""
+    return _change_file(path, section, name, value)
 
 
 def remove_entry(section, name, path=None):

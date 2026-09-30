@@ -16,7 +16,7 @@ The one place for settings and credentials. The directory is mode 700.
 
 | Path | What it holds | Moved by |
 |---|---|---|
-| `settings.ini` | every setting you change, in `[global]`, `[fasrc]`, `[nersc]` and `[relay]`; written by `cluster init` and `cluster config set`, with comments kept | `XDG_CONFIG_HOME` |
+| `settings.ini` | every setting you change, in `[global]`, `[fasrc]`, `[nersc]`, `[relay]` and a section for each backend of your own (its `TYPE` and `HOST`); written by `cluster init`, `cluster config set` and `cluster backends add`, with comments kept | `XDG_CONFIG_HOME` |
 | `.settings.ini.lock` | taken while a command writes `settings.ini` | |
 | `credentials/<backend>/user` | your username on that cluster | `CRED_ROOT`, or `CRED_DIR` for one backend |
 | `credentials/<backend>/pass` | your password, mode 600 | same |
@@ -73,7 +73,7 @@ Logs are rotated at 1 MiB, keeping one previous copy as `<log>.1`.
 | `~/cluster_mounts/<backend>/<login>/` | a mounted cluster home; the root is made, mode 700, by the first mount | `MOUNT_ROOT` |
 | `~/.ssh/nersc`, `~/.ssh/nersc-cert.pub`, `~/.ssh/nersc.pub` | the 24-hour NERSC key and certificate, mode 600 | `KEY` (NERSC) |
 | `~/.ssh/known_hosts` | host keys: new FASRC and NERSC hosts are added on first contact, and NERSC's `@cert-authority` line is added once | |
-| `~/.ssh/config` | not read: `cluster` passes `-F /dev/null` | `SSH_CONFIG` |
+| `~/.ssh/config` | not read for `fasrc` and `nersc`, which pass `-F /dev/null`; read by an ssh backend (`cluster backends add`) | `SSH_CONFIG` |
 | `~/.local/bin/cluster` | the link `cluster init` offers | |
 | `~/.local/bin/nersc` | the link `cluster nersc-tool install-local` makes | |
 | VS Code settings (`~/.vscode-server/data/Machine/settings.json` and `~/.config/Code/User/settings.json` on Linux, `~/Library/Application Support/Code/User/settings.json` on macOS) | `cluster setup` adds the mount root to `files.watcherExclude` in each that exists | `VSCODE_SETTINGS` |

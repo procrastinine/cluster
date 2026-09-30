@@ -649,13 +649,10 @@ class TestOneBackendMachine(_IsolatedMachine):
             self.config.parse_value("BACKEND", "slurmland")
         self.assertEqual(self.config.parse_value("BACKEND", "Perlmutter"), "nersc")
 
-        class Other(backends.Backend):
-            name, label = "other", "Some Other Cluster"
-
-        with patch.dict(backends.BACKENDS, {"other": Other}):
-            self.assertEqual(self.config.parse_value("BACKEND", "other"), "other")
-            os.environ["CLUSTER_BACKEND"] = "other"   # put back by the fixture
-            self.assertEqual(self.config.global_value("BACKEND"), "other")
+        self.config.SETTINGS_FILE.write_text("[other]\nTYPE = ssh\nHOST = box\n")
+        self.assertEqual(self.config.parse_value("BACKEND", "other"), "other")
+        os.environ["CLUSTER_BACKEND"] = "other"   # put back by the fixture
+        self.assertEqual(self.config.global_value("BACKEND"), "other")
 
     def test_an_old_python_is_told_so_in_one_line(self):
         entry = REPO_ROOT / "bin" / "cluster"

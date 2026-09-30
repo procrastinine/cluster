@@ -21,16 +21,16 @@ _CLUSTER_SETTINGS='AUTO_MOUNT BACKEND BOOT_NETWORK_POLL_INTERVAL BOOT_RETRY_DELA
     COMPANION_MAX_BYTES COMPANION_SYNC_TIMEOUT CONNECT_TIMEOUT CRED_DIR CRED_ROOT
     CTL_DIR DEFAULT_LOGIN EXTERNAL_SSH_SERVER_ALIVE_COUNT_MAX
     EXTERNAL_SSH_SERVER_ALIVE_INTERVAL FORCE_PORTABLE FOREIGN_OWNER_OPTIONS GLOBUS
-    GLOBUS_COLLECTION INTERACTIVE_RETRIES KEY LAYOUT_INTERVAL LINGER LINGER_INTERVAL
-    LINGER_KEEPER LIST_WORKERS LOCK_PATIENCE MASTER_READY_WAIT MAX_LOGINS
-    MOUNT_BUSY_GRACE MOUNT_CHECK_TIMEOUT MOUNT_FAILBACK_TICKS MOUNT_FAILOVER
+    GLOBUS_COLLECTION HOST INTERACTIVE_RETRIES KEY LABEL LAYOUT_INTERVAL LINGER
+    LINGER_INTERVAL LINGER_KEEPER LIST_WORKERS LOCK_PATIENCE MASTER_READY_WAIT
+    MAX_LOGINS MOUNT_BUSY_GRACE MOUNT_CHECK_TIMEOUT MOUNT_FAILBACK_TICKS MOUNT_FAILOVER
     MOUNT_FAILOVER_AFTER MOUNT_FAILOVER_TRIES MOUNT_NODES MOUNT_NODE_MAX_DSTATE
-    MOUNT_ROOT NERSC_NODE_CANDIDATES NEW_LOGIN_MODE NODES NODE_PROBE_TIMEOUT
+    MOUNT_ROOT NERSC_NODE_CANDIDATES NEW_LOGIN_MODE NODES NODE_HOSTS NODE_PROBE_TIMEOUT
     NODE_PROBE_TRIES NODE_REACH_SSH_TIMEOUT NODE_REACH_TIMEOUT NTP_SERVER
     ONE_LOGIN_PER_NODE ONE_MOUNT_PER_BACKEND PEER_CONNECT_TIMEOUT POOL_OPEN_TRIES RCLONE
-    RECONNECT_DELAY RECONNECT_DELAY_MAX RECONNECT_HALF_LIFE REFRESH_TRIES
-    REFUSAL_CONFIRM_DELAY RELAY_BIN RELAY_HOST RELAY_RETRIES RELAY_RETRY_DELAY
-    RELAY_RETRY_DELAY_MAX RELAY_RETRY_HALF_LIFE REMOTE_CHECK_TIMEOUT
+    REAPS_ON_LOGOUT RECONNECT_DELAY RECONNECT_DELAY_MAX RECONNECT_HALF_LIFE
+    REFRESH_TRIES REFUSAL_CONFIRM_DELAY RELAY_BIN RELAY_HOST RELAY_RETRIES
+    RELAY_RETRY_DELAY RELAY_RETRY_DELAY_MAX RELAY_RETRY_HALF_LIFE REMOTE_CHECK_TIMEOUT
     REMOTE_COMMAND_TIMEOUT REMOTE_RCLONE SCOPE SETUP_DRIFT_CHECK_INTERVAL
     SETUP_REMOTE_TIMEOUT SETUP_SYNC_NERSC_TOOL SHARED_TRANSFER_CHECKERS
     SHARED_TRANSFER_TRANSFERS SSHPROXY_TIMEOUT SSH_CONFIG SSH_MAX_SESSIONS
@@ -185,6 +185,17 @@ _cluster_is_backend() {
     return 1
 }
 
+_cluster_profiles() {
+    # The backends settings.ini adds, one per line: each section with a TYPE,
+    # as clustertool.backends finds them. Named only with --backend.
+    _cluster_context || { _cluster_with_context _cluster_profiles; return; }
+    local section key value
+    while IFS=$'\t' read -r section key value; do
+        [ "$key" = TYPE ] && ! _cluster_is_backend "$section" && printf '%s\n' "$section"
+    done <<< "$_cluster_ini"
+    return 0
+}
+
 _cluster_normalize_backend() {
     # $1 as the backend it names, into _cluster_word: in lower case, and an
     # alias as its backend. True when $1 is a backend's name or alias, as
@@ -246,7 +257,8 @@ _cluster_context() {
     # Work out what the helpers read, once per TAB: settings.ini
     # (_cluster_ini), the backend the line names (_cluster_named), the one a
     # *new* login and so the node list belongs to (_cluster_be, and as
-    # CLUSTER_<BACKEND>_ spells it, _cluster_BE), and the state directory
+    # CLUSTER_<BACKEND>_ spells it, with '-' as '_': _cluster_BE), and the
+    # state directory
     # (_cluster_root). Returns 1 outside _cluster_with_context, which holds
     # them; a helper called on its own then runs itself inside one.
     local file root
@@ -263,7 +275,7 @@ _cluster_context() {
         _cluster_be="${_cluster_word:-$_CLUSTER_DEFAULT_BACKEND}"
     fi
     _cluster_upper "$_cluster_be"
-    _cluster_BE="$_cluster_word"
+    _cluster_BE="${_cluster_word//-/_}"
     # Same three sources, in the same order, as config.global_value("STATE_ROOT"):
     # the environment, then [global] in settings.ini, then the XDG default, so
     # relocated state completes too.
@@ -398,8 +410,12 @@ _cluster_nodes() {
     _cluster_setting NODES
     if [ -n "$_cluster_value" ]; then
         for node in $_cluster_value; do printf '%s\n' "${node%%.*}"; done
-    else
+    elif _cluster_is_backend "$_cluster_be"; then
         _cluster_builtin_nodes "$_cluster_be"
+    else
+        # An ssh backend's nodes are the ones NODE_HOSTS says how to reach.
+        _cluster_setting NODE_HOSTS
+        for node in $_cluster_value; do printf '%s\n' "${node%%=*}"; done
     fi
     _cluster_fixed_nodes "$_cluster_be"
 }
@@ -427,6 +443,7 @@ _cluster_options() {
         linger) printf '%s\n' -q --quiet --remove-keeper --install-hook ;;
         strays|stray) printf '%s\n' -y --yes --as ;;
         channels|ch) printf '%s\n' --free ;;
+        backends) printf '%s\n' --type --label ;;
         login|l|open|shell|sh|ssh) printf '%s\n' --no-mount ;;
         attach|a|tmux) printf '%s\n' --here --no-mount ;;
         new|n|new-session|task|session)
@@ -553,14 +570,17 @@ _cluster_complete() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     if [[ "$cur" == --backend=* ]]; then
+        _cluster_context
         _cluster_lines_to_reply < <(
-            _cluster_match "${cur%%=*}=" "${cur#*=}" "$_CLUSTER_BACKEND_WORDS")
+            _cluster_match "${cur%%=*}=" "${cur#*=}" \
+                "$_CLUSTER_BACKEND_WORDS $(_cluster_profiles)")
         return
     fi
 
     case "$prev" in
         --backend)
-            _cluster_reply_words "$_CLUSTER_BACKEND_WORDS"
+            _cluster_context
+            _cluster_reply_words "$_CLUSTER_BACKEND_WORDS $(_cluster_profiles)"
             return ;;
         --via|--login)
             _cluster_context
@@ -574,7 +594,8 @@ _cluster_complete() {
             _cluster_reply_words "auto direct relay globus"
             return ;;
         --executor)
-            _cluster_reply_words "$_CLUSTER_BACKENDS"
+            _cluster_context
+            _cluster_reply_words "$_CLUSTER_BACKENDS $(_cluster_profiles)"
             return ;;
         --cwd|-c)
             _cluster_lines_to_reply < <(compgen -d -- "$cur")
@@ -625,7 +646,8 @@ _cluster_complete() {
         case "$word" in
             --) remote=1 ;;
             --backend|--via|--node|--peer-node|--engine|--executor|--cwd|-c|\
-            --as|--wait|--tries|--attempt|--transfers|--checkers) skip=1 ;;
+            --as|--wait|--tries|--attempt|--transfers|--checkers|--type|--label)
+                skip=1 ;;
             -*) ;;
             *) positional+=("$word") ;;
         esac
@@ -662,6 +684,12 @@ _cluster_complete() {
                     get|set|unset)
                         _cluster_reply_words "$_CLUSTER_SETTINGS $_CLUSTER_CREDENTIALS" ;;
                 esac
+            fi ;;
+        backends)
+            if ((argno == 1)); then
+                _cluster_reply_words "add remove"
+            elif ((argno == 2)) && [ "${positional[0]}" = remove ]; then
+                _cluster_reply_words "$(_cluster_profiles)"
             fi ;;
         bridge)
             # Both verbs take the hub login to work through.
@@ -758,7 +786,7 @@ _cluster_complete() {
             _cluster_reply_files "$prefixes" ;;
         list|ls|auth|cert|clean)
             _cluster_reply_words "$(_cluster_options "$verb")" ;;
-        backends|nodes|mounts|status|st|doctor|fixterm|init)
+        nodes|mounts|status|st|doctor|fixterm|init)
             COMPREPLY=() ;;
         mount|m)
             if ((argno == 1)); then

@@ -158,7 +158,7 @@ def cmd_doctor(invocation, args):
 def _not_set_up(report, name, explicit):
     """One backend without a username here: a finding only if it matters."""
     report.section(f"\ncredentials ({name})")
-    fix = f"set it up with: cluster --{name} config credentials"
+    fix = f"set it up with: {backends.BACKENDS[name].setup_command()}"
     recorded = registry.logins_of(name)
     if explicit:
         report.check(name, False, f"not set up; {fix}")
