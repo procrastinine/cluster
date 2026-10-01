@@ -540,7 +540,8 @@ def cmd_rescue(ctx, args):
                if len(args) > 1 else None)
     ctx.by_hand()
     ctx.backend.ensure_credential()
-    remote = (f"tmux attach-session -t {tmux_target(session)}" if session
+    remote = (tmuxlayer.known_term_snippet()
+              + f"tmux attach-session -t {tmux_target(session)}" if session
               else "tmux list-sessions")
     argv = ctx.backend.ssh_argv(node=node, extra=["-t"], remote=remote)
     ui.info(f"rescue: {ctx.backend.short(node)}"

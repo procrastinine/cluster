@@ -72,7 +72,7 @@ class TestStatusRoundTrips(unittest.TestCase):
         def ledger_nodes(self):
             return []
 
-    def status(self, crumbs_read=True, refused=""):
+    def status(self, crumbs_read=True, refused="", crumbs=("old-node\torphan-session\tone",)):
         """Run `status` over two live logins: (output, [(login, command)] sent)."""
         from clustertool import transfer
         from clustertool.tmuxlayer import CRUMBS_MARKER, LAYOUTS_MARKER, LS_MARKER, Tmux
@@ -87,7 +87,7 @@ class TestStatusRoundTrips(unittest.TestCase):
                      f"session-{name}\t1\t0\t{name}\t\t"]
             if CRUMBS_MARKER in command and crumbs_read:
                 # The home is shared, so every login would return this same row.
-                reply += [CRUMBS_MARKER, "old-node\torphan-session\tone"]
+                reply += [CRUMBS_MARKER, *crumbs]
             if LAYOUTS_MARKER in command:
                 reply += [LAYOUTS_MARKER, "old-node"]
             return "\n".join(reply)
@@ -147,6 +147,69 @@ class TestStatusRoundTrips(unittest.TestCase):
         output, _sent = self.status(crumbs_read=False)
         self.assertIn("session breadcrumbs on shared home: unreadable", output)
         self.assertNotIn("session breadcrumbs on shared home: none", output)
+
+    def test_other_workstations_records_are_listed_once_apart(self):
+        from clustertool import workstation
+
+        with _patched(workstation, "ident", lambda: "here-0001"):
+            output, _sent = self.status(crumbs=(
+                "node-a\ttheirs\tmain\tws=there-0002",
+                "node-a\tmine\tone\tws=here-0001"))
+            self.assertEqual(output.count("theirs"), 1, output)
+            self.assertIn("there-0002", output)
+            self.assertIn("mine", output)
+            output, _sent = self.status(
+                crumbs=("node-a\ttheirs\tmain\tws=there-0002",))
+            self.assertIn("session breadcrumbs on shared home: none from this "
+                          "workstation", output)
+            self.assertEqual(output.count("theirs"), 1, output)
+
+
+class TestLayoutSnapshotFiles(unittest.TestCase):
+    """The snapshot snippets, run by a real shell in a scratch home."""
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.bin = self.home / "bin"
+        self.bin.mkdir()
+        self.layouts = self.home / ".cluster" / "layout"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def sh(self, snippet):
+        env = dict(os.environ, HOME=str(self.home),
+                   PATH=f"{self.bin}:/usr/bin:/bin")
+        return subprocess.run(["/bin/sh", "-c", snippet], env=env, text=True,
+                              capture_output=True, timeout=30)
+
+    def tmux(self, body):
+        stub = self.bin / "tmux"
+        stub.write_text(f"#!/bin/sh\n{body}\n")
+        stub.chmod(0o755)
+
+    def save(self):
+        from clustertool.tmuxlayer import Tmux
+
+        logins = SimpleNamespace(
+            backend=SimpleNamespace(short=lambda node: node.split(".")[0]),
+            state=None, node_of=lambda _name: "node-a.example",
+            run_remote=lambda _name, snippet, **_kw: self.sh(snippet))
+        return Tmux(logins).layout_save("one")
+
+    def test_a_node_without_tmux_keeps_its_snapshot_and_no_partial_file(self):
+        from clustertool.tmuxlayer import layout_names_snippet
+
+        self.tmux('printf "s\\t0\\tw\\t/x\\n"')
+        self.assertTrue(self.save())
+        self.tmux("exit 1")
+        self.assertFalse(self.save())
+        self.assertEqual(sorted(os.listdir(self.layouts)), ["node-a"])
+        self.assertIn("s\t0\tw", (self.layouts / "node-a").read_text())
+        (self.layouts / "node-b.tmp").write_text("")  # an older version's
+        self.assertEqual(self.sh(layout_names_snippet()).stdout.split(),
+                         ["node-a"])
 
 
 class TestDoctorSignals(unittest.TestCase):

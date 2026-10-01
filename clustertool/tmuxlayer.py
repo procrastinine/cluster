@@ -299,9 +299,28 @@ def parse_node_and_sessions(text):
     return node, sessions
 
 
+#: What a terminal the node has no description of is attached as.
+FALLBACK_TERM = "xterm-256color"
+
+
+def known_term_snippet():
+    """Remote shell making $TERM one the node's terminfo describes.
+
+    ssh carries the local terminal's TERM, and a newer terminal's own
+    (xterm-ghostty, xterm-kitty, ...) is often missing on a cluster, where
+    tmux then refuses to attach: "missing or unsuitable terminal". So does
+    one described but unable to clear the screen (dumb, unknown). Either
+    becomes FALLBACK_TERM; with no tput to ask, TERM is left alone.
+    """
+    return ('if command -v tput >/dev/null 2>&1 && '
+            '! tput -T "${TERM:-dumb}" clear >/dev/null 2>&1; then '
+            f'TERM={FALLBACK_TERM}; export TERM; fi; ')
+
+
 def layout_names_snippet():
     """Remote shell naming the nodes with a layout snapshot in the shared home."""
     return (f"for f in {LAYOUT_ROOT}/*; do [ -f \"$f\" ] || continue; "
+            'case "$f" in *.tmp) continue;; esac; '
             'basename "$f"; done 2>/dev/null || true')
 
 
@@ -1081,11 +1100,14 @@ class Tmux:
             return False
         short = self.backend.short(node)
         fmt = "#{session_name}\t#{window_index}\t#{window_name}\t#{pane_current_path}"
+        # A node with no tmux server keeps its last snapshot, and the partial
+        # file is removed rather than left for `status` to list as a node.
+        path = f"{LAYOUT_ROOT}/{shlex.quote(short)}"
         snippet = (
             f"mkdir -p {LAYOUT_ROOT} && "
-            f"tmux list-panes -a -F {shlex.quote(fmt)} 2>/dev/null "
-            f"> {LAYOUT_ROOT}/{shlex.quote(short)}.tmp && "
-            f"mv {LAYOUT_ROOT}/{shlex.quote(short)}.tmp {LAYOUT_ROOT}/{shlex.quote(short)}"
+            f"{{ tmux list-panes -a -F {shlex.quote(fmt)} 2>/dev/null "
+            f"> {path}.tmp && mv {path}.tmp {path}; }} || "
+            f"{{ rm -f {path}.tmp; false; }}"
         )
         return self._run(login, snippet).returncode == 0
 
@@ -1325,9 +1347,9 @@ class Tmux:
             # This one carries its own setup: it is handed to ssh as the whole
             # remote command, with no linger prefix in front of it, and -A on
             # a server-less node starts the server.
-            return (linger.scope_setup(self.logins) +
+            return (linger.scope_setup(self.logins) + known_term_snippet() +
                     f"$S tmux new-session -A -s {shlex.quote(session)}")
-        return f"tmux attach-session -t {tmux_target(session)}"
+        return known_term_snippet() + f"tmux attach-session -t {tmux_target(session)}"
 
     def reattach_argv(self, session):
         """What an attach runs after its connection dropped: the session, and
@@ -1338,5 +1360,5 @@ class Tmux:
         gone = shlex.quote(f"cluster: session '{session}' ended while the "
                            "connection was down; not starting a new one")
         return (f"tmux has-session -t {target} 2>/dev/null || "
-                f"{{ echo {gone} >&2; exit 1; }}; "
+                f"{{ echo {gone} >&2; exit 1; }}; " + known_term_snippet() +
                 f"exec tmux attach-session -t {target}")

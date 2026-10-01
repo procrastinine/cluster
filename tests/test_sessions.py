@@ -1176,6 +1176,21 @@ class TestExactTargetsOnRealTmux(unittest.TestCase):
                               universal_newlines=True)
         self.assertNotIn("ended while", proc.stderr, "it went on to attach")
 
+    @unittest.skipUnless(shutil.which("tput"), "needs ncurses' tput")
+    def test_a_terminal_the_node_does_not_know_is_attached_as_a_common_one(self):
+        from clustertool.tmuxlayer import FALLBACK_TERM, known_term_snippet
+
+        def term_after(term):
+            env = dict(self.env, TERM=term)
+            return subprocess.run(["sh", "-c", known_term_snippet() + 'echo "$TERM"'],
+                                  env=env, stdout=subprocess.PIPE,
+                                  universal_newlines=True).stdout.strip()
+
+        self.assertEqual(term_after("no-such-terminal-anywhere"), FALLBACK_TERM)
+        self.assertEqual(term_after(""), FALLBACK_TERM)
+        self.assertEqual(term_after("dumb"), FALLBACK_TERM)
+        self.assertEqual(term_after("vt100"), "vt100")
+
     def test_tags_are_read_and_written_on_the_exact_session(self):
         from clustertool.tmuxlayer import OWNER_OPTION
 

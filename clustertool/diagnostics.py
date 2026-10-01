@@ -17,7 +17,7 @@ import tempfile
 from pathlib import Path
 
 from . import (config, linger, mounts as mountstate, platform as plat,
-               strays as straylib, ui)
+               strays as straylib, ui, workstation)
 from .auth import seconds_left_in_window
 
 
@@ -162,16 +162,24 @@ def status(ctx):
         # the same catalogue, so asking each one would duplicate rows and round
         # trips. A read that failed is said as such: "none" would claim the
         # shared home holds no record of any session.
-        if crumbs is None:
+        # Other workstations' records get their own table below, so they are
+        # left out of this one rather than listed twice.
+        unreadable = crumbs is None
+        crumbs = crumbs or {}
+        mine = {key: owner for key, owner in crumbs.items()
+                if not workstation.is_other(getattr(owner, "workstation", ""))}
+        if unreadable:
             ui.say("\nsession breadcrumbs on shared home: unreadable")
-            crumbs = {}
-        elif crumbs:
+        elif mine:
             ui.say("\nsession breadcrumbs on shared home:")
             ui.table(
                 [[node, session, owner or "-"]
-                 for (node, session), owner in sorted(crumbs.items())],
+                 for (node, session), owner in sorted(mine.items())],
                 ["NODE", "SESSION", "OWNER"],
             )
+        elif crumbs:
+            ui.say("\nsession breadcrumbs on shared home: none from this "
+                   "workstation")
         else:
             ui.say("\nsession breadcrumbs on shared home: none")
 

@@ -1024,6 +1024,12 @@ bracketed-paste, alternate-screen and keyboard modes, and the window size. If a
 program `cluster` did not start leaves your terminal broken, run `cluster
 fixterm`. It needs no login or network, and unlike `reset` it keeps the screen.
 
+A terminal the node has no description of (a newer one's own TERM, such as
+`xterm-ghostty` or `xterm-kitty`), or one that cannot clear the screen, is
+attached as `xterm-256color`, which tmux accepts, instead of being refused as
+"missing or unsuitable". Installing the terminal's terminfo on the cluster
+keeps its own.
+
 ## Tab completion
 
 Completion works in bash 3.2 and later and in zsh; the line to add for each is
