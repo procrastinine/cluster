@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import support  # noqa: E402
 from support import _patched  # noqa: E402
-from clustertool import platform as plat  # noqa: E402
+from clustertool import platform as plat, workstation  # noqa: E402
 
 
 def clean_ctx(ledger=(), **tmux):
@@ -451,8 +451,17 @@ class TestCleanForceIsNotIncludeUntagged(unittest.TestCase):
                             attached=False, windows="1"),
             SimpleNamespace(name="theirs", owner="", foreign="othertool",
                             tagged=True, attached=False, windows="1"),
+            # Made under this machine's workstation ID, by a login it forgot.
             SimpleNamespace(name="old", owner="gone", foreign="", tagged=True,
+                            attached=False, windows="1",
+                            workstation=workstation.ident()),
+            # Made before workstation IDs, by a login unknown here.
+            SimpleNamespace(name="legacy", owner="gone", foreign="", tagged=True,
                             attached=False, windows="1"),
+            # Another machine's: never this machine's to reap.
+            SimpleNamespace(name="laptop", owner="gone", foreign="workstation lap-1",
+                            tagged=True, attached=False, windows="1",
+                            workstation="lap-1"),
         ]
         killed = []
 
@@ -468,10 +477,10 @@ class TestCleanForceIsNotIncludeUntagged(unittest.TestCase):
         from clustertool.cli import COMMANDS, declared_options
 
         self.assertEqual(self.sweep(), ["old"])
-        self.assertEqual(self.sweep(force=True), ["old", "theirs"])
+        self.assertEqual(self.sweep(force=True), ["legacy", "old", "theirs"])
         self.assertEqual(self.sweep(include_untagged=True), ["old", "scratch"])
         self.assertEqual(self.sweep(force=True, include_untagged=True),
-                         ["old", "scratch", "theirs"])
+                         ["legacy", "old", "scratch", "theirs"])
         # And the help says so.
         helps = dict(declared_options(COMMANDS["clean"]))
         self.assertIn("still need --include-untagged", helps["--force"])
@@ -554,7 +563,8 @@ class TestSweepsSettleInTheCommandsTheySend(unittest.TestCase):
         from types import SimpleNamespace
 
         rows = [SimpleNamespace(name="old", owner="gone", foreign="", tagged=True,
-                                attached=False, windows="1")]
+                                attached=False, windows="1",
+                                workstation=workstation.ident())]
         calls = []
 
         def note(*call):
@@ -631,3 +641,34 @@ class TestForgetAsksFirst(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestAnotherWorkstationsRecords(unittest.TestCase):
+    """A breadcrumb another machine wrote is listed apart, never as a stray."""
+
+    def ctx(self, logins=()):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            backend=SimpleNamespace(name="fasrc",
+                                    short=lambda n: (n or "").split(".")[0]),
+            state=SimpleNamespace(known_logins=lambda: list(logins),
+                                  pin_read=lambda _n: "",
+                                  read_meta=lambda _n: {},
+                                  abandoned=lambda: []))
+
+    def test_they_are_elsewhere_not_orphans(self):
+        from clustertool import strays
+
+        Owner = workstation.Owner
+        crumbs = {("holylogin06", "api"): Owner("main", "server-1234"),
+                  ("holylogin06", "mine"): Owner("gone", workstation.ident()),
+                  ("holylogin06", "legacy"): Owner("gone")}
+        found = {s.session: s.state for s in strays.collect(self.ctx(), crumbs)}
+        self.assertEqual(found, {"mine": strays.ORPHAN, "legacy": strays.ORPHAN})
+        apart = strays.elsewhere(self.ctx(), crumbs)
+        self.assertEqual([(s.session, s.owner, s.state) for s in apart],
+                         [("api", "main", "server-1234")])
+        self.assertEqual(strays.classify(Owner("main", "server-1234"), {"main"}),
+                         strays.ELSEWHERE, "a login of the same name here is "
+                         "another login")

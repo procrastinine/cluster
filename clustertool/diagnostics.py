@@ -182,6 +182,10 @@ def status(ctx):
         if found:
             ui.say("")
             straylib.report(found)
+        others = straylib.elsewhere(ctx, crumbs)
+        if others:
+            ui.say("")
+            straylib.report_elsewhere(others)
 
         ui.say("\nlayout snapshots on shared home: " +
                (", ".join(layouts) if layouts else "none"))

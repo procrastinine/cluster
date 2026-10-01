@@ -138,6 +138,10 @@ GLOBAL = {
     "GLOBUS": Setting("", "Globus CLI executable override"),
     "FOREIGN_OWNER_OPTIONS": Setting("", "tmux owner options set by other tools; "
                                          "their sessions are never swept"),
+    # Empty: made once and kept in the state directory. See
+    # clustertool/workstation.py.
+    "WORKSTATION": Setting("", "this machine's ID on sessions and breadcrumbs "
+                               "(empty: generated)"),
     "FORCE_PORTABLE": Setting(0, "exercise portable/macOS implementation paths",
                               flag=True),
 }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from .. import platform as plat, registry, tmuxlayer, ui
+from .. import backends, platform as plat, registry, tmuxlayer, ui, workstation
 from ..command import command
 from ..lifecycle import (close_logins as _close_logins,
                          refresh_login as _refresh_login,
@@ -34,6 +34,68 @@ def session_hint(ctx, session):
             if name == session:
                 return node
     return ""
+
+
+def recorded_elsewhere(ctx, session, crumbs, away_from=""):
+    """``(node, owner)`` of a record of *session* this machine did not make,
+    on a node other than *away_from*; None if there is none.
+
+    Such a record is another workstation's, or names a login unknown here: in
+    either case the session is someone's work on that node, not a name this
+    machine may reuse there or here.
+    """
+    known = set(ctx.state.known_logins())
+    for (node, name), owner in sorted((crumbs or {}).items()):
+        if name != session or node == away_from:
+            continue
+        if workstation.is_other(getattr(owner, "workstation", "")) or (
+                owner and owner not in known):
+            return node, owner
+    return None
+
+
+def login_on_node(ctx, short):
+    """This machine's login on node *short*, or ""."""
+    for name in ctx.state.known_logins():
+        if node_short(ctx, name) == short:
+            return name
+    return ""
+
+
+def attach_elsewhere(ctx, session, node, owner):
+    """Attach to *session* on *node*, which this machine did not start.
+
+    Through this machine's login on that node, or, when it has none, a new
+    login pinned there and named after the node (asked first: it costs an
+    authentication). The session is only attached to — never created,
+    tagged or recorded — so it stays its maker's.
+    """
+    made_on = getattr(owner, "workstation", "")
+    whose = f"'{owner}' on workstation {made_on}" if made_on else f"'{owner}'"
+    via = login_on_node(ctx, node)
+    if not via:
+        via = node
+        tmuxlayer.require_name(via, "login name")
+        if via in ctx.state.known_logins() or registry.is_taken_elsewhere(
+                via, ctx.backend.name):
+            ui.die(f"session '{session}' is on {node}, and the login name "
+                   f"'{via}' is taken",
+                   f"move a login of yours there, then attach through it: "
+                   f"cluster repin LOGIN {node}")
+        backends.refuse_backend_name(via)
+        if not ui.ask_yes(f"'{session}' runs on {node} (started by {whose}). "
+                          f"Open login '{via}' there to attach?", default=True):
+            ui.die("not attached; nothing was opened")
+        ctx.state.pin_write(via, ctx.backend.fqdn(node))
+        ui.info(f"login '{via}' pinned to {node}")
+    else:
+        ui.info(f"'{session}' runs on {node} (started by {whose}); "
+                f"attaching through login '{via}'")
+    ctx.by_hand()
+    ctx.logins.ensure(via)
+    plat.set_process_name(process_label("attach", [via, session]))
+    return ctx.logins.interactive(via, ctx.tmux.attach_argv(session),
+                                  again=ctx.tmux.reattach_argv(session))
 
 
 def node_short(ctx, login):
@@ -222,8 +284,16 @@ def cmd_attach(ctx, args):
     tmuxlayer.require_name(login, "login name")
     tmuxlayer.require_name(session, "session name")
 
-    # attach never creates a login: a typo must not silently spawn one.
+    # attach never creates a login: a typo must not silently spawn one. A
+    # session another workstation started is the exception, offered (asked)
+    # once its record is found.
     if login not in ctx.state.known_logins():
+        if not named_session:
+            for candidate in ctx.logins.active_names():
+                away = recorded_elsewhere(ctx, login, ctx.tmux.crumbs(candidate))
+                if away:
+                    return attach_elsewhere(ctx, login, *away)
+                break
         hint = session_hint(ctx, login)
         ui.die(
             f"no login named '{login}'",
@@ -260,6 +330,13 @@ def cmd_attach(ctx, args):
     # arguments could not be named before we knew what it would attach to.
     plat.set_process_name(process_label("attach", [login, session]))
 
+    if not opts.here and session not in {row.name for row in sessions}:
+        # Not here, and someone else's elsewhere: that is the session meant,
+        # not a new empty one under its name on this node.
+        away = recorded_elsewhere(ctx, session, crumbs,
+                                  away_from=node_short(ctx, login))
+        if away:
+            return attach_elsewhere(ctx, session, *away)
     if not opts.here:
         guard_session_elsewhere(ctx, login, session, crumbs=crumbs)
     steps = ctx.tmux.register_session(login, session, owner=login)

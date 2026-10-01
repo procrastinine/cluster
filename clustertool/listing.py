@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 
-from . import backends, registry, strays as straylib, ui
+from . import backends, registry, strays as straylib, ui, workstation
 
 LIST_HEADERS = ["BACKEND", "LOGIN", "STATE", "NODE", "PINNED", "MOUNT", "SESSIONS"]
 
@@ -20,8 +20,9 @@ def _cached_session_label(names):
 
 
 def _crumb_rows(crumbs):
-    """Breadcrumbs as JSON-friendly rows for the saved evidence file."""
-    return [[node, session, owner]
+    """Breadcrumbs as JSON-friendly rows for the saved evidence file; the
+    fourth field is the workstation that wrote each, "" when none did."""
+    return [[node, session, owner, getattr(owner, "workstation", "")]
             for (node, session), owner in sorted((crumbs or {}).items())]
 
 
@@ -30,7 +31,9 @@ def _crumb_map(rows):
     out = {}
     for row in rows or ():
         if isinstance(row, (list, tuple)) and len(row) >= 2 and row[0] and row[1]:
-            out[(row[0], row[1])] = row[2] if len(row) > 2 else ""
+            out[(row[0], row[1])] = workstation.Owner(
+                row[2] if len(row) > 2 else "",
+                row[3] if len(row) > 3 and isinstance(row[3], str) else "")
     return out
 
 
@@ -318,7 +321,7 @@ def run(ctx, quiet=False):
     # was when the cached table was painted.
     ui.say(_render(evidence, quiet))
 
-    found, stale_evidence = [], False
+    found, elsewhere, stale_evidence = [], [], False
     for backend_name in ctx.scope():
         sub = ctx.sibling(backend_name)
         crumbs = _evidence_crumbs(evidence, backend_name)
@@ -326,6 +329,7 @@ def run(ctx, quiet=False):
             crumbs, stale_evidence = cached_crumbs(sub), True
         found += straylib.collect(sub, crumbs,
                                   live=_evidence_live(evidence, backend_name))
+        elsewhere += straylib.elsewhere(sub, crumbs)
         # Abandonments on a node a login still occupies are not strays —
         # something is looking at them, and `clean` can reap them there.
         occupied = straylib.occupied_nodes(sub)
@@ -334,6 +338,9 @@ def run(ctx, quiet=False):
                 ui.warn(f"{backend_name}: session '{session}' left on {node} "
                         f"when '{former}' moved off it")
                 ui.note("reap it with: cluster clean")
+    if elsewhere:
+        ui.say("")
+        straylib.report_elsewhere(elsewhere)
     if found:
         ui.say("")
         straylib.report(found)

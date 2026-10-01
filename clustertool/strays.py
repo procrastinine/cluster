@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections import namedtuple
 
-from . import ui
+from . import ui, workstation
 
 #: One recorded session sitting where no login is looking.
 Stray = namedtuple("Stray", "backend node session owner state")
@@ -42,6 +42,12 @@ LOST = "lost"
 
 STRAY_HEADERS = ["BACKEND", "NODE", "SESSION", "RECORDED OWNER", "STATE"]
 
+#: Recorded by another workstation: its login is looking after it, from there.
+#: Not a stray — listed apart, and nothing here acts on it.
+ELSEWHERE = "elsewhere"
+
+ELSEWHERE_HEADERS = ["BACKEND", "NODE", "SESSION", "OWNER", "WORKSTATION"]
+
 
 def occupied_nodes(ctx):
     """``{short node: login}`` for every login of this backend with a node.
@@ -60,6 +66,8 @@ def occupied_nodes(ctx):
 
 def classify(owner, known_logins):
     """Which kind of stray a crumb's recorded owner makes it."""
+    if workstation.is_other(getattr(owner, "workstation", "")):
+        return ELSEWHERE
     if not owner:
         return ORPHAN
     if owner in known_logins:
@@ -91,6 +99,8 @@ def collect(ctx, crumbs, live=None):
                  for node, session, former in ctx.state.abandoned()}
     found = {}
     for (node, session), owner in (crumbs or {}).items():
+        if workstation.is_other(getattr(owner, "workstation", "")):
+            continue
         if node in occupied:
             seen = live.get(node)
             if seen is None or session in seen:
@@ -108,6 +118,29 @@ def collect(ctx, crumbs, live=None):
         found[(node, session)] = Stray(ctx.backend.name, node, session,
                                        former or "-", ABANDONED)
     return [found[key] for key in sorted(found)]
+
+
+def elsewhere(ctx, crumbs):
+    """``[Stray]`` for *crumbs* other workstations wrote.
+
+    The owner column is the login on that machine; it means nothing here.
+    """
+    # The state field carries the workstation, which is the column shown.
+    return [Stray(ctx.backend.name, node, session, str(owner) or "-",
+                  owner.workstation)
+            for (node, session), owner in sorted((crumbs or {}).items())
+            if workstation.is_other(getattr(owner, "workstation", ""))]
+
+
+def report_elsewhere(entries):
+    """Sessions other workstations started, and how to reach one from here."""
+    if not entries:
+        return
+    ui.say(ui.dim(ui.render_table(
+        [[s.backend, s.node, s.session, s.owner, s.state] for s in entries],
+        ELSEWHERE_HEADERS)))
+    ui.note(f"{len(entries)} session(s) from other workstations, left to them; "
+            f"attach from here: cluster attach {entries[0].session}")
 
 
 def select(strays, token):
@@ -163,6 +196,11 @@ def report(strays, prefix="cluster strays"):
                 f"{'these nodes' if len(nodes_of(rest)) > 1 else 'this node'}: "
                 + ", ".join(nodes_of(rest)))
         ui.note(f"see if they still exist: {prefix} check {nodes_of(rest)[0]}")
+        if any(s.state == ORPHAN and s.owner != "-" for s in rest):
+            # Written before workstation IDs, a record by another machine
+            # sharing this home looks exactly like this machine's orphan.
+            ui.note("an orphan's owner may be a login on another machine "
+                    "sharing this home, from before workstation IDs")
     if lost:
         ui.say(ui.red(render(lost)))
         ui.warn(f"{len(lost)} session(s) recorded on a node that is not "

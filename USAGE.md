@@ -632,6 +632,34 @@ that does not exist, and sessions you abandoned. Sessions tagged by another
 tool (`FOREIGN_OWNER_OPTIONS`) and untagged sessions are reported and left
 alone. `--force` also reaps foreign-tagged sessions and lets a sweep run while a
 pinned login is disconnected; untagged sessions need `--include-untagged`.
+Sessions another machine started are never reaped, `--force` or not; see
+[Using more than one machine](#using-more-than-one-machine).
+
+### Using more than one machine
+
+Running `cluster` on a second machine (a laptop, alongside an always-on
+server) needs nothing special: each machine has its own logins, and they share
+the cluster home. Each machine tags the sessions it starts with its own ID
+(`WORKSTATION`, made once and kept in the state directory), and records the
+ID in each breadcrumb.
+
+- `cluster ls` and `status` list the other machine's sessions apart, as
+  `elsewhere`, rather than as strays.
+- `cluster attach SESSION` reaches one: through this machine's login on that
+  node, or, after asking, a new login pinned there and named after the node.
+  It attaches without creating, tagging or recording anything, so the session
+  stays the other machine's. `cluster attach LOGIN SESSION` does the same when
+  SESSION is not on LOGIN's node but is recorded elsewhere; `--here` makes a
+  new one on LOGIN's node instead.
+- `clean`, `strays` and `rename` never kill, adopt, forget or retag them. A
+  session made before IDs existed, owned by a login this machine does not
+  know, is kept by `clean` unless `--force`; each machine claims its own such
+  sessions on its next sweep.
+
+Give logins on different machines different names (`main` on the server,
+`laptop` on the laptop): a login name means one connection on one machine,
+and two machines' logins of the same name on the same node would each take
+the other's legacy sessions for their own.
 
 On FASRC every node visited costs a TOTP window, so run `clean` deliberately,
 not on a timer. It asks before dropping records of sessions that are gone; `-y`
@@ -864,7 +892,8 @@ backend set up, else `fasrc`; any backend, a [backend of your own](#a-backend-of
 `CRED_ROOT` (`~/.config/cluster/credentials`), `VSCODE_SETTINGS` (empty: every
 VS Code installed here), `VSCODE_TAB_TITLE` (0), `GLOBUS` (the Globus
 CLI), `FOREIGN_OWNER_OPTIONS` (empty; space-separated tmux user options that
-mark sessions another tool owns, which `clean` spares), and `FORCE_PORTABLE`
+mark sessions another tool owns, which `clean` spares), `WORKSTATION` (empty:
+an ID made once for this machine; see [Using more than one machine](#using-more-than-one-machine)), and `FORCE_PORTABLE`
 (0; forces the fallbacks used where Linux-only interfaces such as `/proc` are
 missing, for testing). `RELAY_HOST` and `RELAY_BIN` are the relay client's
 `[relay]` settings; see [below](#from-a-laptop-the-relay-client).

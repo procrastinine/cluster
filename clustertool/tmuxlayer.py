@@ -24,7 +24,7 @@ import collections
 import re
 import shlex
 
-from . import config, linger, strays, ui
+from . import config, linger, strays, ui, workstation
 from .sshmux import COMMAND_TIMEOUT
 from .remote_sh import (EACH_TARGET, for_each_session, home_path, quote_opt,
                         split_target, tmux_target)
@@ -32,6 +32,7 @@ from .remote_sh import (EACH_TARGET, for_each_session, home_path, quote_opt,
 CRUMB_ROOT = "~/.cluster/sessions"
 LAYOUT_ROOT = "~/.cluster/layout"
 OWNER_OPTION = "@cluster_login"
+WS_OPTION = workstation.WORKSTATION_OPTION
 
 #: tmux user options set by *other* tools that own sessions the same way. A
 #: session carrying one of these is somebody else's live work and is never
@@ -45,13 +46,14 @@ _warned_options = set()
 
 
 class Session(collections.namedtuple(
-        "Session", "name windows attached owner tagged foreign created",
-        defaults=(False, "", ""))):
+        "Session", "name windows attached owner tagged foreign created workstation",
+        defaults=(False, "", "", ""))):
     """One tmux session as listed.
 
     *tagged* is True when an explicit owner tag was found (as opposed to
     *owner* defaulting to the session name); *foreign* is non-empty when
-    another tool claims the session.
+    another tool, or another workstation, claims the session; *workstation*
+    is the machine that made it, "" when untagged.
     """
 
     __slots__ = ()
@@ -125,7 +127,8 @@ def list_sessions_snippet():
         'f=""; ' + foreign_reads +
         f'c=$(tmux display-message -p -t {EACH_TARGET} "#{{t:session_created}}" '
         "2>/dev/null); "
-        'printf "%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$s" "$w" "$a" "$o" "$f" "$c"; '
+        f"m=$(tmux show-options -qv -t {EACH_TARGET} {WS_OPTION} 2>/dev/null); "
+        'printf "%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$s" "$w" "$a" "$o" "$f" "$c" "$m"; '
         "done 2>/dev/null || true"
     )
 
@@ -370,12 +373,16 @@ def crumbs_snippet():
 
 
 def parse_crumbs(text):
-    """``{(node_short, session): owning_login}`` from :func:`crumbs_snippet`."""
+    """``{(node_short, session): owning_login}`` from :func:`crumbs_snippet`.
+
+    Each owner is a :class:`workstation.Owner`, a str that also says which
+    machine wrote the record (a second field older versions never read).
+    """
     result = {}
     for line in (text or "").splitlines():
         parts = line.split("\t")
         if len(parts) >= 2 and parts[0] and parts[1]:
-            result[(parts[0], parts[1])] = parts[2] if len(parts) > 2 else ""
+            result[(parts[0], parts[1])] = workstation.parse_crumb_fields(parts[2:])
     return result
 
 
@@ -435,6 +442,28 @@ def register_session_snippet(login, session, owner=None, node=None):
     )
 
 
+def _ws_tag_snippet(target):
+    """Remote shell tagging *target* with this workstation, unless already tagged."""
+    return (f"cur=$(tmux show-options -qv -t {target} {WS_OPTION} 2>/dev/null); "
+            f'if [ -z "$cur" ]; then tmux set-option -t {target} {WS_OPTION} '
+            f"{shlex.quote(workstation.ident())} >/dev/null 2>&1; fi")
+
+
+def _crumb_printf(owner):
+    """A printf writing a breadcrumb's contents: the owner, a tab, this machine."""
+    return f"printf '%s\\t%s\\n' {shlex.quote(owner)} " \
+           f"{shlex.quote(workstation.CRUMB_FIELD + workstation.ident())}"
+
+
+def _crumb_owner_is(path, owner_q):
+    """A shell test: the breadcrumb at *path* names *owner_q* (shell-quoted)
+    and was written by this machine or by a version that recorded none."""
+    mine = shlex.quote(workstation.CRUMB_FIELD + workstation.ident())
+    return (f'{{ [ "$(cut -f1 {path} 2>/dev/null)" = {owner_q} ] && '
+            f'{{ w=$(cut -s -f2 {path} 2>/dev/null); [ -z "$w" ] || '
+            f'[ "$w" = {mine} ]; }}; }}')
+
+
 def record_session_snippet(login, session, owner=None, node=None):
     """Remote shell that tags an existing session's owner and records its crumb.
 
@@ -459,9 +488,10 @@ def record_session_snippet(login, session, owner=None, node=None):
         f"tmux set-option -t {target} {OWNER_OPTION} {shlex.quote(owner)} >/dev/null 2>&1; "
         f"fi; "
         f'printf "%s\\t%s\\t%s\\n" {STEP_MARKER} owner $?; '
+        f"{_ws_tag_snippet(target)}; "
         f"{where}; "
         f'if [ -n "$n" ]; then '
-        f'mkdir -p {root}/"$n" && printf "%s\\n" {shlex.quote(login)} '
+        f'mkdir -p {root}/"$n" && {_crumb_printf(login)} '
         f'> {root}/"$n"/{sess}; '
         f"else false; fi; "
         f'printf "%s\\t%s\\t%s\\n" {STEP_MARKER} crumb $?'
@@ -501,6 +531,11 @@ def parse_sessions(text):
             continue
         owner = parts[3].strip() if len(parts) > 3 else ""
         foreign = parts[4].strip() if len(parts) > 4 else ""
+        made_on = parts[6].strip() if len(parts) > 6 else ""
+        # Another workstation's session is foreign here in every way that
+        # matters: listed and attachable, but never swept, tagged or killed.
+        if not foreign and workstation.is_other(made_on):
+            foreign = f"workstation {made_on}"
         rows.append(Session(
             name=parts[0],
             windows=parts[1],
@@ -512,6 +547,7 @@ def parse_sessions(text):
             tagged=bool(owner),
             foreign=foreign,
             created=parts[5].strip() if len(parts) > 5 else "",
+            workstation=made_on,
         ))
     return rows
 
@@ -798,11 +834,13 @@ class Tmux:
         set_option = (f"tmux set-option -t {target} {OWNER_OPTION} "
                       f"{shlex.quote(owner)} >/dev/null 2>&1")
         if force:
-            snippet = set_option
+            snippet = (set_option + f"; tmux set-option -t {target} {WS_OPTION} "
+                       f"{shlex.quote(workstation.ident())} >/dev/null 2>&1")
         else:
             snippet = (
                 f"cur=$(tmux show-options -qv -t {target} {OWNER_OPTION} 2>/dev/null); "
-                f'if [ -z "$cur" ]; then ' + set_option + "; fi"
+                f'if [ -z "$cur" ]; then ' + set_option + "; fi; "
+                + _ws_tag_snippet(target)
             )
         return self._run(login, snippet).returncode == 0
 
@@ -839,7 +877,7 @@ class Tmux:
         short = self.backend.short(node)
         snippet = (
             f"mkdir -p {CRUMB_ROOT}/{shlex.quote(short)} && "
-            f"printf '%s\\n' {shlex.quote(owner or login)} > "
+            f"{_crumb_printf(owner or login)} > "
             f"{CRUMB_ROOT}/{shlex.quote(short)}/{shlex.quote(session)}"
         )
         return self._run(login, snippet).returncode == 0
@@ -873,23 +911,29 @@ class Tmux:
         and runs for as long as it keeps printing (_run_printing).
         """
         old_q, new_q = shlex.quote(old_owner), shlex.quote(new_owner)
+        mine_q = shlex.quote(workstation.ident())
+        crumb = f'{CRUMB_ROOT}/"$h"/"$s"'
         retag = (
             f"o=$(tmux show-options -qv -t {EACH_TARGET} {OWNER_OPTION} 2>/dev/null); "
+            # Another workstation's session keeps its owner: its login of the
+            # same name is a different login.
+            f"m=$(tmux show-options -qv -t {EACH_TARGET} {WS_OPTION} 2>/dev/null); "
+            f'if [ -z "$m" ] || [ "$m" = {mine_q} ]; then '
             # An untagged session is still ours if the breadcrumb says so: the
             # tag is set after the session exists, and a failed tag write leaves
             # the breadcrumb as the only ownership record.
             f'if [ "$o" = {old_q} ] || {{ [ -z "$o" ] && '
-            f'[ "$(cat {CRUMB_ROOT}/"$h"/"$s" 2>/dev/null)" = {old_q} ]; }}; then '
+            f"{_crumb_owner_is(crumb, old_q)}; }}; then "
             f"tmux set-option -t {EACH_TARGET} {OWNER_OPTION} {new_q} "
-            ">/dev/null 2>&1; fi; echo ."
+            ">/dev/null 2>&1; fi; fi; echo ."
         )
         snippet = (
             "h=$(hostname -s); " + for_each_session(retag) + "; "
             # breadcrumbs: the file name is the session, the contents the owner
             f"for d in {CRUMB_ROOT}/*/; do [ -d \"$d\" ] || continue; "
             'for f in "$d"*; do [ -f "$f" ] || continue; '
-            f'if [ "$(cat "$f" 2>/dev/null)" = {old_q} ]; then '
-            f"printf '%s\\n' {new_q} > \"$f\"; fi; echo .; "
+            f'if {_crumb_owner_is(chr(34) + "$f" + chr(34), old_q)}; then '
+            f"{_crumb_printf(new_owner)} > \"$f\"; fi; echo .; "
             "done; done; printf done"
         )
         proc = self._run_printing(login, snippet)
@@ -908,8 +952,8 @@ class Tmux:
         d = f"{CRUMB_ROOT}/{shlex.quote(node_short)}"
         snippet = (
             f'for f in {d}/*; do [ -f "$f" ] || continue; '
-            f'if [ "$(cat "$f" 2>/dev/null)" = {old_q} ]; then '
-            f"printf '%s\\n' {new_q} > \"$f\"; fi; done; printf done"
+            f'if {_crumb_owner_is(chr(34) + "$f" + chr(34), old_q)}; then '
+            f"{_crumb_printf(new_owner)} > \"$f\"; fi; done; printf done"
         )
         return self._sh(login, snippet) == "done"
 
@@ -1000,6 +1044,21 @@ class Tmux:
             return (0, 0)
         live = {row.name: row.owner for row in sessions}
         recorded = {s for (n, s) in crumbs if n == short}
+        # Sessions made before workstation IDs, owned by this login on its own
+        # node, are claimed for this machine — once, after which every other
+        # machine leaves them alone. Another machine whose login has a
+        # different name never claims them.
+        unclaimed = [row.name for row in sessions
+                     if row.tagged and row.owner == login and not row.workstation
+                     and not row.foreign]
+        if unclaimed:
+            self._run(login, "; ".join(_ws_tag_snippet(tmux_target(name))
+                                       for name in unclaimed))
+            for name in unclaimed:
+                if name in recorded and not getattr(crumbs.get((short, name)),
+                                                    "workstation", ""):
+                    self.crumb_add(login, name, node)
+        foreign = {row.name for row in sessions if row.foreign}
         # Deliberately *not* pruned here: crumbs for other nodes. Deleting a
         # record for a node this login cannot see is how live work becomes
         # unfindable. They are published instead — `ls`, `status` and the
@@ -1007,7 +1066,7 @@ class Tmux:
         self.last_strays = strays.collect(self, crumbs)
         added = removed = 0
         for session, owner in live.items():
-            if session not in recorded and owner == login:
+            if session not in recorded and owner == login and session not in foreign:
                 if self.crumb_add(login, session, node):
                     added += 1
         gone = sorted(recorded - set(live))
@@ -1152,9 +1211,14 @@ class Tmux:
     @staticmethod
     def _kills(sessions):
         """Remote shell killing *sessions* by exact name, naming each tmux found."""
+        # The last line of defence for another machine's work: whatever chose
+        # these, a session tagged by a different workstation is not killed.
+        mine_q = shlex.quote(workstation.ident())
         return "; ".join(
+            f"m=$(tmux show-options -qv -t {tmux_target(session)} {WS_OPTION} "
+            f'2>/dev/null); if [ -z "$m" ] || [ "$m" = {mine_q} ]; then '
             f"tmux kill-session -t {tmux_target(session)} >/dev/null 2>&1 && "
-            f'printf "%s\\t%s\\n" {STEP_MARKER} {shlex.quote(session)}'
+            f'printf "%s\\t%s\\n" {STEP_MARKER} {shlex.quote(session)}; fi'
             for session in sessions)
 
     @staticmethod

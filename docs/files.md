@@ -53,6 +53,7 @@ Logs are rotated at 1 MiB, keeping one previous copy as `<log>.1`.
 | `nersc/sshproxy.lock`, `nersc/sshproxy.window` | held while a NERSC certificate is fetched, so one fetch runs at a time and a second uses what the first installed; the TOTP window the last fetch used, so no code is sent twice |
 | `<backend>/probe-<login>-*.result` | a mount probe's answer; removed once read |
 | `nersc/bridge.record`, `nersc/bridge.lock` | the last bridge push (when, to which login and node, until when its certificate is valid, and whether the end-to-end check passed), and the lock that keeps `--cron` pushes from overlapping |
+| `workstation` | this machine's ID, made once (`WORKSTATION` overrides it); see [USAGE.md](../USAGE.md#using-more-than-one-machine) |
 | `setup-local-health.json` | when `cluster setup` last checked this machine, and what it found |
 | `setup-backups/` | each VS Code settings file as it was before `cluster setup` changed it |
 | `relay-<host>-<pid>.conf` | a relay transfer's rclone configuration, mode 600, removed when it ends; one left by a killed transfer is removed by the next |
@@ -95,7 +96,7 @@ shares.
 
 | Path | What it holds |
 |---|---|
-| `~/.cluster/sessions/<node>/<session>` | a breadcrumb for each session `cluster` created, naming the login that owns it; how `ls`, `clean`, `strays` and `restore-layout` know a session exists when nobody is watching it |
+| `~/.cluster/sessions/<node>/<session>` | a breadcrumb for each session `cluster` created, naming the login that owns it and, after a tab, `ws=` and the workstation that made it; how `ls`, `clean`, `strays` and `restore-layout` know a session exists when nobody is watching it |
 | `~/.cluster/layout/<node>` | the watcher's snapshot of that node's sessions, windows and working directories, every `LAYOUT_INTERVAL` seconds |
 | `~/.cluster/linger/<node>` | FASRC: a note that `cluster` enabled linger on that node, so only linger it enabled is ever released |
 | your crontab on a login node | FASRC, with `LINGER_KEEPER` on: one line marked `cluster-linger-keeper`; nothing else in the crontab is touched |
@@ -103,8 +104,9 @@ shares.
 | `.cluster-probe-*` at the top of a mounted home | a mount's health probe: a directory made and removed at once |
 | `~/.ssh/known_hosts` on FASRC | a direct transfer adds the NERSC host it connects to on first contact |
 
-Each tmux session also carries a user option, `@cluster_login`, naming its
-owner. It lives in the tmux server, not in a file.
+Each tmux session also carries two user options: `@cluster_login`, naming its
+owner, and `@cluster_workstation`, naming the machine that made it. They live
+in the tmux server, not in a file.
 
 ## On a bridge hub
 

@@ -1222,7 +1222,52 @@ class TestExactTargetsOnRealTmux(unittest.TestCase):
         self.assertTrue(self.layer.retag_owner("main", "old", "new"))
         owners = {row.name: row.owner for row in self.layer.list_sessions("main")}
         self.assertEqual(owners, {"my work": "new", "api": "new", "api2": "someone"})
-        self.assertEqual(elsewhere.read_text(), "new\n")
+        from clustertool import workstation
+
+        self.assertEqual(elsewhere.read_text(), f"new\tws={workstation.ident()}\n")
+
+    def test_another_workstations_sessions_are_listed_but_never_touched(self):
+        from clustertool import workstation
+        from clustertool.tmuxlayer import OWNER_OPTION, WS_OPTION
+
+        host = subprocess.run(["hostname", "-s"], stdout=subprocess.PIPE,
+                              universal_newlines=True).stdout.strip()
+        self.start("theirs", "mine", "legacy")
+        for name in ("theirs", "mine", "legacy"):
+            self.tmux("set-option", "-t", f"={name}:", OWNER_OPTION, "old")
+        self.tmux("set-option", "-t", "=theirs:", WS_OPTION, "laptop-0001")
+        self.tmux("set-option", "-t", "=mine:", WS_OPTION, workstation.ident())
+        # The other machine's record, as it writes one; an older version
+        # reads only the owner before the tab.
+        theirs = self.crumb(host, "theirs", owner="old\tws=laptop-0001")
+        rows = {row.name: row for row in self.layer.list_sessions("main")}
+        self.assertEqual(rows["theirs"].foreign, "workstation laptop-0001")
+        self.assertEqual(rows["mine"].foreign, "")
+        self.assertEqual(rows["legacy"].foreign, "")
+        # A rename here does not move what the other machine owns...
+        self.assertTrue(self.layer.retag_owner("main", "old", "new"))
+        owners = {row.name: row.owner for row in self.layer.list_sessions("main")}
+        self.assertEqual(owners, {"theirs": "old", "mine": "new", "legacy": "new"})
+        self.assertEqual(theirs.read_text(), "old\tws=laptop-0001\n")
+        # ...and a kill, however it was chosen, does not take it.
+        killed, failed = self.layer.kill_sessions("main", ["theirs", "legacy"])
+        self.assertEqual((killed, failed), (["legacy"], ["theirs"]))
+        self.assertEqual(self.names(), {"theirs", "mine"})
+
+    def test_a_breadcrumb_says_which_workstation_wrote_it(self):
+        from clustertool import tmuxlayer, workstation
+
+        self.start("api")
+        self.assertTrue(self.layer.crumb_add("main", "api", node="node1"))
+        record = self.home / ".cluster" / "sessions" / "node1" / "api"
+        self.assertEqual(record.read_text(), f"main\tws={workstation.ident()}\n")
+        crumbs = self.layer.crumbs("main")
+        self.assertEqual(crumbs[("node1", "api")], "main")
+        self.assertEqual(crumbs[("node1", "api")].workstation, workstation.ident())
+        # A record from before workstations has none, and reads as before.
+        self.crumb("node1", "old")
+        self.assertEqual(self.layer.crumbs("main")[("node1", "old")].workstation, "")
+        self.assertEqual(tmuxlayer.parse_crumbs("n\ts\tmain\n")[("n", "s")], "main")
 
 
 class TestRefreshSettlesTheNodeItLeaves(unittest.TestCase):

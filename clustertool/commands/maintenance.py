@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 
 from .. import (backends, platform as plat, registry, strays as straylib,
-                tmuxlayer, ui)
+                tmuxlayer, ui, workstation)
 from ..auth import is_rejection
 from ..command import command
 
@@ -517,6 +517,7 @@ def clean_backend(ctx, opts):
             f"{', '.join(ctx.backend.short(n) for n in targets)}")
 
     killed, failed, kept = [], [], {"protected": [], "foreign": [], "untagged": [],
+                                    "unclaimed": [],
                                     "stray": []}
     unreachable = []
     # A credential refused on one node is refused on every other, and each
@@ -581,8 +582,12 @@ def clean_backend(ctx, opts):
                          "elsewhere): " + ", ".join(sorted(kept["stray"]))))
         ui.note("decide what happens to them: cluster strays")
     if kept["foreign"]:
-        ui.say(ui.yellow("kept (owned by another tool): "
+        ui.say(ui.yellow("kept (owned by another tool or workstation): "
                          + ", ".join(sorted(kept['foreign']))))
+    if kept["unclaimed"]:
+        ui.say(ui.yellow("kept (owned by a login unknown here, perhaps another "
+                         "machine's): " + ", ".join(sorted(kept["unclaimed"]))))
+        ui.note("pass --force to reap these too")
     if kept["untagged"]:
         ui.say(ui.yellow("kept (no ownership tag, cannot prove they are orphans): "
                          + ", ".join(sorted(kept['untagged']))))
@@ -617,7 +622,17 @@ def sweep_targets(ctx, everything=False, crumbs=None):
             node = ctx.logins.node_of(name)
             if node:
                 candidates.append(node)
-        for crumb_node, _session in crumbs:
+        known = set(ctx.state.known_logins())
+        for (crumb_node, _session), owner in crumbs.items():
+            # Only records that could be this machine's are worth a visit,
+            # and on FASRC each visit costs an authentication: one another
+            # workstation wrote, or one naming a login unknown here that no
+            # workstation claimed, has nothing on it `clean` would reap.
+            ws = getattr(owner, "workstation", "")
+            if workstation.is_other(ws):
+                continue
+            if owner not in known and not ws:
+                continue
             candidates.append(ctx.backend.fqdn(crumb_node))
         candidates += ctx.state.ledger_nodes()
         candidates += [ctx.backend.fqdn(n) for (n, _s, _f) in ctx.state.abandoned()]
@@ -648,7 +663,9 @@ def _reapable(ctx, opts, short, rows, abandoned_here, protected, stray, known,
             kept["stray"].append(label)
         elif (short, row.name) in protected:
             kept["protected"].append(label)
-        elif row.foreign and not opts.force:
+        # Another machine's work is not this machine's to reap, --force or not.
+        elif row.foreign and (not opts.force or workstation.is_other(
+                getattr(row, "workstation", ""))):
             kept["foreign"].append(f"{label} [{row.foreign}]")
         # Only its own flag reaps these: a session nobody tagged may be
         # somebody's hand-made work, and --force is for other questions.
@@ -656,6 +673,12 @@ def _reapable(ctx, opts, short, rows, abandoned_here, protected, stray, known,
             kept["untagged"].append(label)
         elif row.tagged and row.owner in known and ctx.logins.is_active(row.owner):
             kept["protected"].append(label)
+        # Owned by a login unknown here and claimed by no workstation: made
+        # before workstation IDs, possibly by another machine sharing this
+        # home. Not provably an orphan of this one.
+        elif (row.tagged and row.owner not in known
+              and not getattr(row, "workstation", "") and not opts.force):
+            kept["unclaimed"].append(f"{label} [{row.owner}]")
         else:
             doomed[row.name] = label
     return doomed
