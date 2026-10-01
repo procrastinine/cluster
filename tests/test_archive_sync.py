@@ -1080,7 +1080,10 @@ fi
     def test_a_symlinked_wrapper_runs_the_archive_sync_it_was_shipped_with(self):
         linked = self.root / "linkbin"
         linked.mkdir()
-        (linked / "archive-sync-cron").symlink_to(os.path.relpath(CRON, linked))
+        # Relative to the resolved directory: macOS's temporary directory is
+        # under /var, a symlink to /private/var, and the link resolves from there.
+        (linked / "archive-sync-cron").symlink_to(
+            os.path.relpath(CRON, os.path.realpath(linked)))
         # No archive-sync on PATH: only resolving the link finds the real one,
         # which, with nothing configured, refuses with exit 3. Started by a
         # relative path, with an exported CDPATH that `cd` would search.

@@ -267,10 +267,20 @@ class TestInit(_IsolatedMachine):
         self.stack.enter_context(_patched(
             diagnostics, "_rclone_found",
             lambda: RcloneFound(None, None, "not found")))
+        # Nor is macFUSE installed, whatever this Mac has.
+        from clustertool import macfuse
+
+        self.stack.enter_context(_patched(
+            macfuse, "status",
+            lambda: macfuse.Status(False, "", False, False, False, False, False)))
 
     def tearDown(self):
-        self.assertEqual(self.reached, [], "nothing may run or connect unasked")
-        super().tearDown()
+        # The patches come off whatever this finds: left on, a stubbed Popen
+        # would fail every test after this one.
+        try:
+            self.assertEqual(self.reached, [], "nothing may run or connect unasked")
+        finally:
+            super().tearDown()
 
     def init(self, *flags, stdin=""):
         with _patched(sys, "stdin", io.StringIO(stdin)):
@@ -308,9 +318,11 @@ class TestInit(_IsolatedMachine):
         self.assertEqual(self.setting("BACKEND"), "fasrc")
         self.assertEqual(self.setting("AUTO_MOUNT"), "0")
         self.assertEqual(self.link.resolve(), ENTRY.resolve())
-        self.assertIn("export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc", out)
-        for said in ("sshfs and fusermount not installed", "rsync not installed",
-                     "rclone not found"):
+        startup = "~/.bash_profile" if plat.IS_MAC else "~/.bashrc"
+        self.assertIn(f"export PATH=\"$HOME/.local/bin:$PATH\"' >> {startup}", out)
+        missing = "sshfs and macFUSE not installed" if plat.IS_MAC else \
+            "sshfs and fusermount not installed"
+        for said in (missing, "rsync not installed", "rclone not found"):
             self.assertIn(said, out)
         self.assertIn("Try logging in to Harvard FASRC now?", err)
         self.assertIn("next: cluster --fasrc new work", out)

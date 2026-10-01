@@ -30,6 +30,16 @@ sys.path.insert(0, str(REPO_ROOT))
 #: completion reads the same setting.
 COMPLETION_SCRIPT = REPO_ROOT / "completions" / "cluster.bash"
 
+# --- the operating system the suite runs on ------------------------------------
+# Most macOS behaviour is tested everywhere, by patching platform.IS_MAC: the
+# decisions are plain Python. A test that asks the real system something only
+# one of them has (getfsstat, BSD ps, a Linux /proc, a shell's startup file)
+# carries one of these, so each platform runs what it can answer.
+IS_MACOS = sys.platform == "darwin"
+MACOS_ONLY = unittest.skipUnless(IS_MACOS, "asks macOS itself")
+LINUX_ONLY = unittest.skipUnless(sys.platform.startswith("linux"),
+                                 "asks Linux itself")
+
 # --- the sandbox -------------------------------------------------------------
 # The suite never touches the machine that runs it: not its credentials,
 # settings, state, ~/.ssh or mounts, and not the environment that names them.

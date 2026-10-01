@@ -210,6 +210,11 @@ SHARED = {
     # spent. 0 allows sharing a node.
     "ONE_LOGIN_PER_NODE": Setting(1, "refuse two managed logins on one tmux server",
                                   flag=True),
+    # macFUSE 5 mounts through its kernel extension or through FSKit (macOS
+    # 26+), each behind its own approval; auto takes whichever macOS allows,
+    # the kext first. See clustertool/macfuse.py.
+    "MACFUSE_BACKEND": Setting("auto", "macFUSE backend for mounts on macOS",
+                               choices=("auto", "kext", "fskit")),
     "MOUNT_CHECK_TIMEOUT": Setting(8, "seconds before a mount probe is considered slow"),
     # After a missed probe deadline, how long to watch the FUSE queue to tell a
     # saturated mount (depth moving) from a wedged one (depth frozen). Doubles

@@ -72,7 +72,7 @@ class Watcher:
         #: not), so the reason is logged when it changes.
         self._refused = ""
         #: Whether "mounts are off" has been said.
-        self._mounts_off = False
+        self._mounts_off = ""
 
     def log(self, message):
         self._keep_log_bounded()
@@ -245,12 +245,13 @@ class Watcher:
 
         if not self.settings.flag("AUTO_MOUNT"):
             return True
-        missing = plat.mount_tools_missing()
-        if missing:
-            if not self._mounts_off:
-                self.log(f"{' and '.join(missing)} is not installed, so mounts are off")
-                self._mounts_off = True
+        unavailable = self.mounts.mounts_unavailable()
+        if unavailable:
+            if self._mounts_off != unavailable:
+                self.log(f"{unavailable}, so mounts are off")
+                self._mounts_off = unavailable
             return True
+        self._mounts_off = ""
         if not self.mounts.is_mounted(self.name):
             holder = self.mounts.mounted_elsewhere(self.name)
             if holder:

@@ -13,6 +13,7 @@ a Linux login node.
 
 from __future__ import annotations
 
+import collections
 import errno
 import fcntl
 import os
@@ -43,6 +44,25 @@ FORCE_PORTABLE = config.global_value("FORCE_PORTABLE", "0") == "1"
 #: signal reaches it until the kernel lets go, and waiting to reap it would
 #: hang this process on the very thing its deadline was guarding against.
 REAP_GRACE = 5.0
+
+#: Where the base system keeps the tools a mount needs. cron and launchd start
+#: jobs with PATH=/usr/bin:/bin, and macOS's mount, umount, diskutil and kmutil
+#: live in /sbin and /usr/sbin, so a lookup on PATH alone fails exactly where a
+#: watcher started at login runs.
+_SYSTEM_DIRS = ("/sbin", "/usr/sbin", "/bin", "/usr/bin")
+
+def system_tool(name):
+    """The path of base-system program *name*: PATH first, then the system
+    directories. *name* itself when neither has it, so running it still fails
+    in the usual way, with 127."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in _SYSTEM_DIRS:
+        candidate = os.path.join(directory, name)
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return name
 
 
 def run(
@@ -738,13 +758,112 @@ def mount_table_has(mountpoint):
     """Ask the kernel, never the filesystem.
 
     A wedged FUSE mount makes stat(2) block forever, so mount-point checks must
-    read the mount table instead. mount(8)/mountinfo never touch the mount.
+    read the mount table instead. Linux's mountinfo never touches a mount.
+    macOS's mount(8) does: behind a wedged FSKit volume it blocks in the
+    kernel, unkillably, and an answer that timed out would read as "not
+    mounted". So on macOS the table comes from getfsstat(MNT_NOWAIT), which
+    reports what the kernel already knows without asking any file system.
     """
     if not FORCE_PORTABLE and Path("/proc/self/mountinfo").exists():
         return _mountinfo_fields(mountpoint) is not None
-    lines = [f"{line} " for line in out(["mount"], timeout=10).splitlines()]
-    return any(f" on {mp} " in line
-               for mp in _table_spellings(mountpoint) for line in lines)
+    return _mount_entry(mountpoint) is not None
+
+
+#: (type, mounted on, mounted from) for one entry of the mount table.
+MountEntry = collections.namedtuple("MountEntry", "fstype on source")
+
+
+def _mount_entry(mountpoint):
+    spellings = _table_spellings(mountpoint)
+    for entry in mount_entries():
+        if entry.on in spellings:
+            return entry
+    return None
+
+
+def mount_entries():
+    """The mount table as MountEntry records, read without blocking.
+
+    getfsstat on macOS, falling back to parsing mount(8) — the only way on
+    a BSD without it, and the branch CLUSTER_FORCE_PORTABLE exercises.
+    """
+    if IS_MAC and not FORCE_PORTABLE:
+        entries = _getfsstat()
+        if entries is not None:
+            return entries
+    entries = []
+    for line in out([system_tool("mount")], timeout=10).splitlines():
+        source, sep, rest = line.partition(" on ")
+        if not sep:
+            continue
+        # macOS: "src on /mp (type, flags…)"; Linux: "src on /mp type T (flags)".
+        on, paren, flags = rest.rpartition(" (")
+        if not paren:
+            on, flags = rest, ""
+        fstype = flags.split(",", 1)[0].strip(") ")
+        if " type " in on:
+            on, _, fstype = on.rpartition(" type ")
+        entries.append(MountEntry(fstype, on, source))
+    return entries
+
+
+def _getfsstat():
+    """macOS's mount table from getfsstat(MNT_NOWAIT), or None if unavailable.
+
+    MNT_NOWAIT returns the statistics the kernel holds, so no file system is
+    asked anything; measured instantaneous beside a wedged FSKit volume that
+    held every mount(8) in uninterruptible sleep (macOS 27.0).
+    """
+    import ctypes
+    import ctypes.util
+
+    class Statfs(ctypes.Structure):  # struct statfs, 64-bit inodes: 2168 bytes
+        _fields_ = [("f_bsize", ctypes.c_uint32), ("f_iosize", ctypes.c_int32),
+                    ("f_blocks", ctypes.c_uint64), ("f_bfree", ctypes.c_uint64),
+                    ("f_bavail", ctypes.c_uint64), ("f_files", ctypes.c_uint64),
+                    ("f_ffree", ctypes.c_uint64), ("f_fsid", ctypes.c_int32 * 2),
+                    ("f_owner", ctypes.c_uint32), ("f_type", ctypes.c_uint32),
+                    ("f_flags", ctypes.c_uint32), ("f_fssubtype", ctypes.c_uint32),
+                    ("f_fstypename", ctypes.c_char * 16),
+                    ("f_mntonname", ctypes.c_char * 1024),
+                    ("f_mntfromname", ctypes.c_char * 1024),
+                    ("f_flags_ext", ctypes.c_uint32),
+                    ("f_reserved", ctypes.c_uint32 * 7)]
+
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        # Intel Macs export the 64-bit-inode struct under its own symbol.
+        call = getattr(libc, "getfsstat$INODE64", None) or libc.getfsstat
+        call.restype = ctypes.c_int
+        call.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        mnt_nowait = 2
+        for _ in range(3):  # the table can grow between the two calls
+            count = call(None, 0, mnt_nowait)
+            if count < 0:
+                return None
+            buf = (Statfs * (count + 4))()
+            got = call(buf, ctypes.sizeof(buf), mnt_nowait)
+            if got < 0:
+                return None
+            if got < len(buf):
+                break
+        decode = lambda raw: os.fsdecode(raw)  # noqa: E731
+        return [MountEntry(decode(item.f_fstypename), decode(item.f_mntonname),
+                           decode(item.f_mntfromname)) for item in buf[:got]]
+    except (OSError, AttributeError, TypeError, ValueError):
+        return None
+
+
+def is_fskit_mount(mountpoint):
+    """Is *mountpoint* a macFUSE mount served through FSKit?
+
+    FSKit names its volumes by resource, so the table lists such a mount as
+    from ``macfuse://<uuid>``; through the kext it is from sshfs's fsname.
+    """
+    if not IS_MAC:
+        return False
+    entry = _mount_entry(mountpoint)
+    return bool(entry) and entry.source.startswith("macfuse://")
 
 
 def _unescape_mount(field):
@@ -837,8 +956,9 @@ def unmount(mountpoint):
     """
     mp = str(mountpoint)
     if IS_MAC:
-        attempts = (["umount", mp], ["diskutil", "unmount", "force", mp],
-                    ["umount", "-f", mp])
+        umount, diskutil = system_tool("umount"), system_tool("diskutil")
+        attempts = ([umount, mp], [diskutil, "unmount", "force", mp],
+                    [umount, "-f", mp])
     else:
         cmd = shutil.which("fusermount3") or shutil.which("fusermount")
         attempts = ([cmd, "-u", mp], [cmd, "-uz", mp]) if cmd else ()
@@ -851,7 +971,7 @@ def unmount(mountpoint):
 
 def have_unmount():
     if IS_MAC:
-        return shutil.which("umount") is not None
+        return os.path.isabs(system_tool("umount"))
     return shutil.which("fusermount3") is not None or shutil.which("fusermount") is not None
 
 

@@ -592,6 +592,40 @@ def _version(parts):
     return ".".join(str(p) for p in parts)
 
 
+def _mount_row():
+    """("mounts", available, detail), naming the macFUSE backend on macOS.
+
+    macFUSE installed is not macFUSE usable: each of its backends waits behind
+    an approval macOS keeps, and a mount through one not yet allowed hangs
+    instead of failing. So this says which backend a mount would use, and
+    for each one not ready, what to allow.
+    """
+    from . import macfuse
+
+    missing = plat.mount_tools_missing()
+    st = macfuse.status() if plat.IS_MAC else None
+    if st is not None and not st.installed:
+        missing.append("macFUSE")
+    if missing:
+        return ("mounts", False,
+                f"{' and '.join(missing)} not installed; "
+                f"{plat.sshfs_install_hint()}, or turn mounts off: "
+                "cluster config set AUTO_MOUNT 0")
+    sshfs = shutil.which("sshfs")
+    if not plat.IS_MAC:
+        return ("mounts", True, sshfs)
+    preference = config.resolve("MACFUSE_BACKEND")[0]
+    backend, why = macfuse.choose(preference, st)
+    states = "; ".join(f"{label.split()[-1]} {detail.split(';')[0]}"
+                       for label, _ok, detail in macfuse.describe(st))
+    version = f"macFUSE {st.version}" if st.version else "macFUSE"
+    if backend:
+        return ("mounts", True, f"{sshfs}, {version} via {backend} ({states})")
+    return ("mounts", False,
+            f"{version} cannot mount yet ({states}): {why}; or turn mounts "
+            "off: cluster config set AUTO_MOUNT 0")
+
+
 def feature_rows():
     """``[(feature, available, detail)]`` for every optional part of the tool.
 
@@ -603,17 +637,7 @@ def feature_rows():
     from .transfer import MIN_RCLONE
 
     rows = []
-    missing = plat.mount_tools_missing()
-    # The mount options this tool passes on macOS are macFUSE's, so its bundle
-    # is named when absent. Only doctor looks: a mount still goes ahead, and
-    # sshfs then reports what it lacks.
-    if plat.IS_MAC and not Path("/Library/Filesystems/macfuse.fs").exists():
-        missing.append("macFUSE")
-    rows.append(("mounts", not missing,
-                 shutil.which("sshfs") if not missing else
-                 f"{' and '.join(missing)} not installed; "
-                 f"{plat.sshfs_install_hint()}, or turn mounts off: "
-                 "cluster config set AUTO_MOUNT 0"))
+    rows.append(_mount_row())
 
     rsync = shutil.which("rsync")
     rows.append(("push, pull and bridge", bool(rsync),
@@ -750,7 +774,9 @@ def machine_checks(report):
                  + (" (portable shims forced)" if plat.FORCE_PORTABLE else ""))
     report.check("mount table source", True,
                  "/proc/self/mountinfo" if Path("/proc/self/mountinfo").exists()
-                 and not plat.FORCE_PORTABLE else "mount(8)")
+                 and not plat.FORCE_PORTABLE else
+                 "getfsstat" if plat.IS_MAC and not plat.FORCE_PORTABLE
+                 and plat._getfsstat() is not None else "mount(8)")
     report.check("process listing", True,
                  "/proc" if Path("/proc").is_dir() and not plat.FORCE_PORTABLE
                  else "ps")

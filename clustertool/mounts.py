@@ -52,6 +52,9 @@ SSHFS_OPTS = [
     "follow_symlinks",
 ]
 
+#: How long sshfs is given to put a mount in the mount table.
+MOUNT_TIMEOUT = 90
+
 #: What a probe's mkdir says when the transport under the mount is gone:
 #: ENOTCONN on Linux, ENXIO from a dead macFUSE daemon.
 _DEAD_TRANSPORT = ("not connected", "transport endpoint", "connection reset",
@@ -312,11 +315,36 @@ class Mounts:
         FUSE connection fails them, and the unmount still needs its lazy form,
         because anything holding a descriptor (a VS Code file watcher is
         enough) keeps a plain one at EBUSY. macFUSE has no connection to abort:
-        there it is the daemon's death that fails the queue (ENXIO), so sshfs
-        is stopped first, and umount then diskutil release the mount.
+        through its kernel extension it is the daemon's death that fails the
+        queue (ENXIO), so sshfs is stopped first, and umount then diskutil
+        release the mount.
+
+        Through FSKit the order is the reverse. The volume belongs to macFUSE's
+        FSKit extension, which fails what is queued itself when it is told to
+        unmount, while a daemon stopped under a live FSKit volume leaves the
+        mount point blocking every later mkdir and stat until the Mac restarts
+        (macOS 27.0, macFUSE 5.4.0). So the force unmount goes first, with the
+        daemon still connected, and the daemon is stopped only if that fails —
+        and then the unmount is tried once more.
+
+        A daemon that died by itself (a crash, an OOM kill) leaves exactly that
+        blocked mount point, and nothing addressed to the volume releases it.
+        What does is restarting macFUSE's FSKit extension, the one process
+        serving every FSKit volume of this user: the kernel fails what waits on
+        it, and launchd starts a fresh one. See _release_fskit.
         """
         mp = self.mountpoint(name)
-        if plat.IS_MAC:
+        if plat.IS_MAC and self._served_by_fskit(name, mp):
+            plat.unmount(mp)
+            if plat.mount_table_has(mp):
+                self._stop_daemons(name, mp)
+                plat.unmount(mp)
+            else:
+                self._await_daemon_exit(name, mp)
+                self._stop_daemons(name, mp)
+            if not mount_point_responds(mp):
+                self._release_fskit(mp, quiet=quiet)
+        elif plat.IS_MAC:
             self._stop_daemons(name, mp)
             plat.unmount(mp)
         else:
@@ -327,8 +355,105 @@ class Mounts:
         return not plat.mount_table_has(mp)
 
     def _stop_daemons(self, name, mp):
-        for pid in self.sshfs_pids(name, mp) + self.sftp_channel_pids(name):
+        for pid in (self.sshfs_pids(name, mp) + self.helper_pids(mp)
+                    + self.sftp_channel_pids(name)):
             self.logins._stop_pid(pid)
+
+    def _release_fskit(self, mp, quiet=True):
+        """Restart macFUSE's FSKit extension to free a blocked mount point.
+
+        True once *mp* answers again. The extension serves every FSKit volume
+        of this user, so it is restarted only when each other one it serves is
+        a mount of this tool, which its watcher remounts; otherwise this says
+        what is in the way and leaves the choice to the person.
+        """
+        from . import macfuse
+
+        root = str(config.MOUNT_ROOT)
+        others = [entry.on for entry in plat.mount_entries()
+                  if entry.source.startswith("macfuse://")
+                  and entry.on != str(mp)
+                  and not (entry.on == root or entry.on.startswith(root + os.sep))]
+        pids = macfuse.fskit_module_pids()
+        if not pids:
+            return mount_point_responds(mp)
+        if others:
+            ui.warn(f"the mount point {short_path(mp)} is held by macFUSE's FSKit "
+                    "extension, which also serves " + ", ".join(others))
+            ui.note("restarting it frees the mount point and drops those: "
+                    f"kill -9 {' '.join(map(str, pids))}")
+            return False
+        for pid in pids:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        if not quiet:
+            ui.info("restarted macFUSE's FSKit extension to release "
+                    f"{short_path(mp)}")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if mount_point_responds(mp, timeout=3):
+                return True
+            time.sleep(0.5)
+        return False
+
+    def _served_by_fskit(self, name, mp):
+        """Was this mount made through FSKit? What mount() recorded, else the
+        mount table's flags (a mount made by an older version records nothing)."""
+        recorded = self.state.read_meta(name).get("fuse_backend")
+        if recorded:
+            return recorded == "fskit"
+        return plat.is_fskit_mount(mp)
+
+    def _await_daemon_exit(self, name, mp, timeout=10.0):
+        """Give sshfs *timeout* seconds to exit after its mount was released."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self.sshfs_pids(name, mp):
+            time.sleep(0.25)
+
+    def helper_pids(self, mountpoint):
+        """macFUSE's mount_macfuse helpers still trying to mount *mountpoint*.
+
+        One outlives a failed attempt: sent to a backend macOS has not
+        allowed, it waits for an approval indefinitely, and a second attempt
+        then queues behind it.
+        """
+        if not plat.IS_MAC:
+            return []
+        mp = str(mountpoint)
+        return [pid for pid, cmd in plat.own_processes()
+                if _program(cmd) == "mount_macfuse" and _has_argument(cmd, mp)]
+
+    def mounts_unavailable(self):
+        """Why no mount can be made on this machine, or "".
+
+        Missing tools everywhere, and on macOS a macFUSE that macOS will not
+        mount through. Either is a fact of the machine, not a fault of the
+        mount, so the watcher and auto-mount say it once and carry on; repairing
+        would end by rebuilding a healthy login for nothing.
+        """
+        missing = plat.mount_tools_missing()
+        if missing:
+            return f"{' and '.join(missing)} is not installed"
+        if plat.IS_MAC:
+            from . import macfuse
+
+            backend, why = macfuse.usable(self.settings.str("MACFUSE_BACKEND"))
+            if backend is None:
+                return f"macFUSE cannot mount here: {why}"
+        return ""
+
+    def macfuse_backend(self):
+        """The macFUSE backend to mount with; dies saying what to allow if none."""
+        from . import macfuse
+
+        backend, why = macfuse.usable(self.settings.str("MACFUSE_BACKEND"))
+        if backend is None:
+            ui.die(f"cannot mount on this Mac: {why}",
+                   "check with: cluster doctor",
+                   "or turn mounts off: cluster config set AUTO_MOUNT 0")
+        return backend
 
     # --- mounting -----------------------------------------------------------
     def mount(self, name, remote=None, mountpoint=None, quiet=False, node=None,
@@ -352,6 +477,9 @@ class Mounts:
             ui.die(f"cannot mount: {' and '.join(missing)} is not installed",
                    plat.sshfs_install_hint(),
                    "or turn mounts off: cluster config set AUTO_MOUNT 0")
+        # Decided before anything is started: a mount through a backend macOS
+        # has not allowed never fails, it waits, holding a channel.
+        fuse_backend = self.macfuse_backend() if plat.IS_MAC else None
         own = self.mountpoint(name)
         mp = Path(mountpoint) if mountpoint else own
         remote = remote or self.remote_path(name)
@@ -388,7 +516,13 @@ class Mounts:
             # defaults make a remote Linux tree behave oddly without these.
             opts += [f"volname=cluster-{self.backend.name}-{name}",
                      "defer_permissions", "noappledouble"]
+            if fuse_backend == "fskit":
+                opts.append("backend=fskit")
         argv = ["sshfs"]
+        if fuse_backend == "fskit":
+            # FSKit refuses a daemon that forks after mounting, and the parent
+            # then never returns; sshfs stays in the foreground, detached.
+            argv.append("-f")
         for opt in opts:
             argv += ["-o", opt]
         # The mount always rides a master that is already authenticated, so it
@@ -405,25 +539,68 @@ class Mounts:
         argv.append(f"{self.backend.target(target_node)}:{remote}")
         argv.append(str(mp))
 
-        proc = plat.run(argv, timeout=90)
-        if proc.returncode != 0 or not plat.mount_table_has(mp):
-            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        if fuse_backend == "fskit":
+            mounted, output = self._mount_foreground(argv, mp, log)
+        else:
+            proc = plat.run(argv, timeout=MOUNT_TIMEOUT)
+            output = (proc.stderr or "") + (proc.stdout or "")
+            mounted = proc.returncode == 0 and plat.mount_table_has(mp)
+            if not mounted and proc.returncode == 124:
+                output += f"\nsshfs did not finish mounting in {MOUNT_TIMEOUT}s"
+        if not mounted:
+            # Nothing from a failed attempt may stay behind: a daemon or a
+            # macFUSE helper still waiting would hold a channel, and make the
+            # next attempt queue behind it.
+            self._stop_daemons(name, mp)
+            if plat.mount_table_has(mp):
+                plat.unmount(mp)
+            detail = output.strip().splitlines()
             # A rider that found no master says so on a line of its own, and
             # the line sshfs adds after it ("read: Connection reset") says less.
             detail = [line for line in detail if line.startswith("cluster: ")] or detail
             plat.rotate_log(log)
             with log.open("a", encoding="utf-8") as handle:
                 handle.write(f"--- {time.strftime('%F %T')} mount failed ---\n")
-                handle.write((proc.stderr or "") + (proc.stdout or "") + "\n")
+                handle.write(output + "\n")
             ui.die(f"could not mount {name} at {short_path(mp)}",
                    detail[-1] if detail else "no error output",
                    f"sshfs log: {log}")
 
-        self.state.write_meta(name, mountpoint=str(mp), remote=remote)
+        self.state.write_meta(name, mountpoint=str(mp), remote=remote,
+                              fuse_backend=fuse_backend or "")
         if not quiet:
             where = f" via {self.backend.short(target_node)}" if node else ""
             ui.info(f"mounted {name} at {short_path(mp)}{where}")
         return True
+
+    def _mount_foreground(self, argv, mp, log):
+        """Start a foreground sshfs and wait for its mount. (mounted, output).
+
+        The daemon appends to the sshfs log for as long as it runs; *output*
+        is what it wrote there during this attempt.
+        """
+        plat.rotate_log(log)
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(f"--- {time.strftime('%F %T')} mounting (FSKit) ---\n")
+        offset = plat.file_size(log)
+        proc = plat.spawn_detached(argv, log_path=log)
+        deadline = time.monotonic() + MOUNT_TIMEOUT
+        mounted, note = False, f"sshfs did not finish mounting in {MOUNT_TIMEOUT}s"
+        while time.monotonic() < deadline:
+            if plat.mount_table_has(mp):
+                mounted, note = True, ""
+                break
+            if proc.poll() is not None:
+                note = f"sshfs exited with status {proc.returncode}"
+                break
+            time.sleep(0.25)
+        try:
+            with log.open("rb") as handle:
+                handle.seek(offset)
+                output = handle.read().decode("utf-8", "replace")
+        except OSError:
+            output = ""
+        return mounted, (output + "\n" + note).strip()
 
     def _make_mountpoint(self, mp):
         """Create *mp*, found absent from the mount table, without a stat.
@@ -433,6 +610,17 @@ class Mounts:
         """
         if config.MOUNT_ROOT in mp.parents:
             config.private_dir(config.MOUNT_ROOT)
+        if plat.IS_MAC and _listed_in_parent(mp):
+            # A mount point a macFUSE volume left behind badly blocks every
+            # call on it in the kernel, where no signal reaches the caller, so
+            # an existing one is first asked about from a child this process
+            # can walk away from. Its parent, this tool's own directory, is
+            # never mounted and answers; a name not yet in it cannot be stuck.
+            if not mount_point_responds(mp, timeout=10) and \
+                    not self._release_fskit(mp, quiet=False):
+                ui.die(f"the mount point {short_path(mp)} does not respond",
+                       "macOS still holds a volume that was there; restarting "
+                       "the Mac releases it")
         try:
             mp.parent.mkdir(parents=True, exist_ok=True)
             os.mkdir(mp)
@@ -468,7 +656,18 @@ class Mounts:
         if not plat.mount_table_has(mp):
             self.state.mountnode_clear(name)
             return True
-        self.unwedge(name, quiet=True)
+        if plat.IS_MAC and self.healthy(name):
+            # A mount that answers is released the ordinary way, with sshfs
+            # still serving it, and the daemon exits once it is gone. Stopping
+            # the daemon first is the remedy for a wedged mount only: done to
+            # a live FSKit mount it leaves the mount point blocking every
+            # later mkdir and stat (macOS 27.0, macFUSE 5.4.0).
+            plat.run([plat.system_tool("umount"), str(mp)], timeout=20)
+            self._await_daemon_exit(name, mp)
+        if plat.mount_table_has(mp):
+            self.unwedge(name, quiet=True)
+        else:
+            self._stop_daemons(name, mp)
         gone = not plat.mount_table_has(mp)
         if self.state.mountnode_read(name):
             self.close_mount_master(name)
@@ -827,6 +1026,26 @@ def _probe_answer(result):
     if any(marker in lowered for marker in _DEAD_TRANSPORT):
         return ERRORED, text.strip().splitlines()[0]
     return ANSWERED, "ok"
+
+
+def _listed_in_parent(mp):
+    """Is *mp* an entry of its parent? Read from the parent, never from *mp*."""
+    try:
+        return mp.name in os.listdir(mp.parent)
+    except OSError:
+        return False
+
+
+def mount_point_responds(mp, timeout=5):
+    """Does a mkdir -p of *mp* finish? Asked from a child it can abandon.
+
+    After a macFUSE volume goes badly, the directory under it can block every
+    call in the kernel, where no signal reaches the caller; only a child can
+    ask that and be walked away from.
+    """
+    if not plat.IS_MAC:
+        return True
+    return plat.run(["/bin/mkdir", "-p", str(mp)], timeout=timeout).returncode != 124
 
 
 def _program(cmd):

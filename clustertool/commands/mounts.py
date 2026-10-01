@@ -19,10 +19,10 @@ def auto_mount(ctx, login, skip=False):
     """
     if skip or not ctx.settings.flag("AUTO_MOUNT"):
         return False
-    missing = plat.mount_tools_missing()
-    if missing:
-        ui.note(f"{' and '.join(missing)} is not installed, so mounts are off; "
-                "install it, or turn mounts off: cluster config set AUTO_MOUNT 0")
+    unavailable = ctx.mounts.mounts_unavailable()
+    if unavailable:
+        ui.note(f"{unavailable}, so mounts are off; see: cluster doctor, or "
+                "turn mounts off: cluster config set AUTO_MOUNT 0")
         return False
     if not ctx.mounts.is_mounted(login):
         holder = ctx.mounts.mounted_elsewhere(login)

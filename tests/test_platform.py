@@ -351,8 +351,10 @@ class TestPlatform(unittest.TestCase):
         self.assertFalse(plat.mount_table_has("/definitely/not/mounted"))
 
     def test_own_processes_are_listed_by_their_words(self):
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)",
-                                  "one word"])
+        # /bin/sh, not sys.executable: macOS's /usr/bin/python3 is a shim that
+        # runs another binary, which ps then reports instead. Two commands, so
+        # the shell cannot exec itself into the last one.
+        child = subprocess.Popen(["/bin/sh", "-c", "sleep 30; :", "sh", "one word"])
         self.addCleanup(child.wait)
         self.addCleanup(child.kill)
         self.assertEqual(dict(plat.own_processes())[child.pid], " ".join(child.args))

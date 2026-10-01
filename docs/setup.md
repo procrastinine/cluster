@@ -131,15 +131,31 @@ A mount needs macFUSE and an SSHFS built for it:
 1. Install macFUSE, from its site (see the
    [macFUSE wiki](https://github.com/macfuse/macfuse/wiki)) or with
    `brew install --cask macfuse`.
-2. Allow its system extension in System Settings, Privacy & Security. On Apple
-   silicon, macOS first asks you to allow third-party kernel extensions: shut
-   down, start up holding the power button, and choose **Reduced Security**
-   with user management of kernel extensions in Startup Security Utility.
+2. Allow one of its two backends. macFUSE 5 mounts through either:
+   - **FSKit** (macOS 26 and later; no kernel extension, no restart): open
+     `/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app` once,
+     then turn on macFUSE in System Settings, General, Login Items &
+     Extensions, File System Extensions.
+   - **its kernel extension**: allow it in System Settings, Privacy &
+     Security. On Apple silicon, macOS first asks you to allow third-party
+     kernel extensions: shut down, start up holding the power button, and
+     choose **Reduced Security** with user management of kernel extensions in
+     Startup Security Utility.
 3. Install SSHFS: the SSHFS 2.5.0 package from macFUSE's site, or sshfs 3.x
    with `brew install gromgit/fuse/sshfs-mac`. Both work.
 
-`cluster doctor` reports mounts as off until both macFUSE and `sshfs` are
-present.
+`cluster doctor` names the backend a mount would use and, for each one that is
+not ready, what to allow: for example `macFUSE 5.4.0 via fskit (kext not
+loaded; FSKit enabled)`. `MACFUSE_BACKEND` (`auto`, `kext` or `fskit`) picks
+one; `auto` takes a loaded kext, then an enabled FSKit, then a kext that loads
+when asked. Until a backend is allowed, mounts are off and say so, rather than
+waiting on an approval that never comes.
+
+With FSKit, sshfs runs in the foreground (it cannot daemonize under FSKit),
+detached from the terminal. A mount that is answering is unmounted with sshfs
+still serving it; a crashed sshfs leaves its mount point blocked, and
+`cluster repair` (or the watcher) releases it by restarting macFUSE's FSKit
+extension, when every other FSKit volume it serves is one of this tool's.
 
 Keep editors and indexers out of the mount root. `cluster setup --local-only`
 adds `**/cluster_mounts/**` to `files.watcherExclude` in each VS Code installed

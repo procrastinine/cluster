@@ -26,6 +26,22 @@ from clustertool.backends import load  # noqa: E402
 from clustertool.config import Settings  # noqa: E402
 
 
+_module_patches = contextlib.ExitStack()
+
+
+def setUpModule():
+    # Whatever this Mac's macFUSE can do, a mount here goes through the kext,
+    # the same way these tests mount on Linux: what they test is the rest.
+    from clustertool import macfuse
+
+    _module_patches.enter_context(_patched(
+        macfuse, "usable", lambda _preference="auto": ("kext", "")))
+
+
+def tearDownModule():
+    _module_patches.close()
+
+
 class TestMountBusyVsWedged(unittest.TestCase):
     """A saturated mount and a wedged one both miss the probe deadline.
 
@@ -367,7 +383,8 @@ class TestMountIgnoresTheUsersSshConfig(_IsolatedMachine):
                 contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 mounts.mount("main", mountpoint=str(self.root / "mp"))
-        argv, = ran
+        # On macOS, the failed attempt's cleanup also lists processes (ps).
+        argv, = [argv for argv in ran if argv[0] == "sshfs"]
         self.assertEqual(argv[0], "sshfs")
         self.assertEqual(argv[argv.index("-F") + 1], "/dev/null")
         self.assertLess(argv.index("-F"), argv.index("ControlMaster=no"))

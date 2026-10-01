@@ -250,7 +250,13 @@ class TestDoctorFeatures(unittest.TestCase):
                 return macfuse
             return real_exists(path, *a, **k)
 
+        from clustertool import macfuse as macfuse_mod
+
+        # A macFUSE that is installed here is one whose kext is loaded.
+        status = macfuse_mod.Status(macfuse, "5.4.0" if macfuse else "", macfuse,
+                                    macfuse, False, False, False)
         with _patched(plat, "IS_MAC", mac), \
+                _patched(macfuse_mod, "status", lambda: status), \
                 _patched(diagnostics.shutil, "which", _which(present)), \
                 _patched(plat, "have_unmount", lambda: unmount), \
                 _patched(diagnostics, "_rclone_found", lambda: found), \

@@ -40,7 +40,7 @@ Logs are rotated at 1 MiB, keeping one previous copy as `<log>.1`.
 | `<backend>/<login>.mountnode` | the node the login's mount uses, when that is not the login's own node |
 | `<backend>/login-<login>.lock` | taken while the login's connection is opened or torn down |
 | `<backend>/master-<login>.log`, `master-mnt-<login>.log` | ssh's output from the login's connection and from its mount's own connection |
-| `<backend>/sshfs-<login>.log` | sshfs's output |
+| `<backend>/sshfs-<login>.log` | sshfs's output; on macOS with FSKit, sshfs runs in the foreground and appends here for as long as the mount lives |
 | `<backend>/watch-<login>.log`, `.pid`, `.lock` | the watcher's log, its process id, and the lock that keeps it to one per login |
 | `<backend>/transfer-<tag>.lastnode` | the transfer node that last worked for connection `<tag>`, tried first next time, for example `transfer-pool.lastnode` |
 | `<backend>/transfer-<tag>.users`, `transfer-<tag>.lock` | who holds a lease on a kept transfer connection, and the lock around it |
