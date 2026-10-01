@@ -548,8 +548,10 @@ class Backend:
         if not self.interactive_auth:
             return plat.run(argv, timeout=timeout, capture=capture, env=env)
         said = []
+        # Not interactive: the child reads only the answers typed for it, so
+        # this process's stdin stays where it is, for whatever reads it next.
         rc = self._run_interactive(argv, quiet=quiet, transcript=said, env=env,
-                                   timeout=timeout)
+                                   timeout=timeout, forward_stdin=False)
         # A pty has one stream: the transcript is the authentication chatter and
         # the command's own output, inseparably. It stands in for stderr, because
         # callers reporting a failure have nothing else to show — but it is also
@@ -563,7 +565,7 @@ class Backend:
         return subprocess.CompletedProcess(argv, rc, text, text)
 
     def _run_interactive(self, argv, quiet=True, sink=None, transcript=None,
-                         env=None, timeout=None):
+                         env=None, timeout=None, forward_stdin=True):
         raise NotImplementedError
 
     def exec_interactive(self, argv, transcript=None):
@@ -677,10 +679,10 @@ class InteractiveTotpBackend(Backend):
         return totp(self._secret())
 
     def _run_interactive(self, argv, quiet=True, sink=None, transcript=None,
-                         env=None, timeout=None):
+                         env=None, timeout=None, forward_stdin=True):
         return run_with_prompts(argv, self._password(), self._otp, quiet=quiet,
                                 sink=sink, transcript=transcript, env=env,
-                                timeout=timeout)
+                                timeout=timeout, forward_stdin=forward_stdin)
 
     def credential_state(self):
         try:

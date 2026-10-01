@@ -135,6 +135,29 @@ def rclone_version(binary):
     return parse_rclone_version(text)
 
 
+#: The first rclone that takes known_hosts_file "none"; 1.74 opens a file of
+#: that name and fails.
+QUIET_HOST_KEY_RCLONE = (1, 75)
+
+_host_key_flags = {}
+
+
+def host_key_flags(binary):
+    """Flags that stop *binary* noting it does not check host keys itself.
+
+    It is not meant to: every rclone here rides ssh through --sftp-ssh, and
+    ssh checks the host key (StrictHostKeyChecking and the site's
+    known_hosts). From 1.75 rclone still prints "No host key validation is
+    being performed" on every run unless known_hosts_file is "none".
+    """
+    if binary not in _host_key_flags:
+        version = rclone_version(binary)
+        _host_key_flags[binary] = (
+            ["--sftp-known-hosts-file", "none"]
+            if version and version >= QUIET_HOST_KEY_RCLONE else [])
+    return list(_host_key_flags[binary])
+
+
 def find_rclone(settings):
     """The rclone this machine would use, as an :data:`RcloneFound`.
 
@@ -1032,7 +1055,8 @@ class Transfers:
         # --config /dev/null: the user's rclone config may be password-encrypted
         # and would then prompt, even though every remote here is given on the
         # command line.
-        return [rclone, "--config", "/dev/null", "--sftp-ssh",
+        return [rclone, "--config", "/dev/null", *host_key_flags(rclone),
+                "--sftp-ssh",
                 rclone_ssh_value(self.ssh_command_for(link.sock, link.node))]
 
     def _run_leased(self, specs, rclone, link, quiet):

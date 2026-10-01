@@ -283,7 +283,8 @@ class _Transcript:
 
 
 def run_with_prompts(argv, password, otp_factory, max_answers=3, quiet=False,
-                     sink=None, transcript=None, env=None, timeout=None):
+                     sink=None, transcript=None, env=None, timeout=None,
+                     forward_stdin=True):
     """Run *argv* under a pty, typing the password and OTP when asked.
 
     Stdin is forwarded, so this works for interactive shells as well as for
@@ -303,6 +304,10 @@ def run_with_prompts(argv, password, otp_factory, max_answers=3, quiet=False,
     *timeout* bounds the whole run, as for :func:`clustertool.platform.run`:
     once it passes, the child's process group is killed and the result is
     124. *transcript*, a list, collects the output as text.
+
+    *forward_stdin* False keeps this process's stdin out of the pty, for a
+    child that reads nothing but the answers: a master opened from a script
+    fed on stdin would otherwise swallow the rest of that script.
     """
     if sink is None:
         sink = sys.stderr.buffer
@@ -328,7 +333,7 @@ def run_with_prompts(argv, password, otp_factory, max_answers=3, quiet=False,
 
     try:
         timed_out = _converse(fd, password, otp_factory, max_answers, quiet,
-                              sink, record, deadline)
+                              sink, record, deadline, forward_stdin)
         if timed_out:
             # pty.fork made the child a session leader, so its process group
             # is everything it started. SIGKILL, because what is hung here is
@@ -354,7 +359,7 @@ def run_with_prompts(argv, password, otp_factory, max_answers=3, quiet=False,
 
 
 def _converse(fd, password, otp_factory, max_answers, quiet, sink, record,
-              deadline):
+              deadline, forward_stdin=True):
     """Relay between the pty and stdin until the child closes it.
 
     Returns True when *deadline* passed first.
@@ -364,11 +369,11 @@ def _converse(fd, password, otp_factory, max_answers, quiet, sink, record,
     tail = b""
     latch = _AnswerLatch()
 
-    stdin_fd = sys.stdin.fileno()
     try:
-        stdin_open = sys.stdin.isatty() or not sys.stdin.closed
-    except ValueError:
-        stdin_open = False
+        stdin_fd = sys.stdin.fileno()
+        stdin_open = forward_stdin and (sys.stdin.isatty() or not sys.stdin.closed)
+    except (ValueError, AttributeError, OSError):
+        stdin_fd, stdin_open = -1, False
 
     while True:
         wait = None

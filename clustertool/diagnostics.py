@@ -293,6 +293,54 @@ def repo_root():
     return Path(__file__).resolve().parent.parent
 
 
+THIS, COPY, OTHER = "this", "copy", "other"
+
+
+def cluster_kind(path, entry=None):
+    """What the `cluster` at *path* is: THIS checkout's entry point, a COPY of
+    this tool from another checkout, or some OTHER program of the same name.
+
+    Homebrew's graphviz installs a `cluster` of its own (a graph layout
+    filter), and on a Mac with graphviz it is often the first on PATH. Its
+    first bytes are a Mach-O header, while this tool's entry point is a
+    Python script that imports clustertool.
+    """
+    entry = Path(entry or repo_root() / "bin" / "cluster")
+    try:
+        if Path(path).resolve() == entry.resolve():
+            return THIS
+        with open(path, "rb") as handle:
+            head = handle.read(4096)
+    except OSError:
+        return OTHER
+    return COPY if head.startswith(b"#!") and b"clustertool" in head else OTHER
+
+
+def other_cluster_name(path):
+    """A few words for a foreign `cluster`: whose it is, when that is known."""
+    try:
+        resolved = str(Path(path).resolve())
+    except OSError:
+        resolved = str(path)
+    if "/graphviz/" in resolved.lower():
+        return f"{path} is Graphviz's `cluster`, a different program"
+    return f"{path} is a different program called `cluster`"
+
+
+def clusters_on_path(path_env=None):
+    """Every `cluster` on PATH, in the order a shell would try them."""
+    found, seen = [], set()
+    for directory in (path_env if path_env is not None
+                      else os.environ.get("PATH", "")).split(os.pathsep):
+        candidate = os.path.join(directory or ".", "cluster")
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            found.append(candidate)
+    return found
+
+
 def hook_entry_point():
     """The `cluster` a shutdown hook should run: the one running now.
 
@@ -304,7 +352,11 @@ def hook_entry_point():
     argv0 = sys.argv[0] if sys.argv else ""
     if os.path.basename(argv0) == "cluster":
         return os.path.abspath(argv0)
-    return shutil.which("cluster") or str(repo_root() / "bin" / "cluster")
+    # Never a `cluster` that is some other program (Graphviz has one).
+    for found in clusters_on_path():
+        if cluster_kind(found) != OTHER:
+            return found
+    return str(repo_root() / "bin" / "cluster")
 
 
 def render_hook(text, kind, program=None, repo=None):

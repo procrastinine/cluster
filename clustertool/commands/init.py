@@ -82,19 +82,31 @@ def _this_machine():
         if not found:
             missing.append(tool)
     found = shutil.which("cluster")
-    if found and Path(found).resolve() == ENTRY.resolve():
+    kind = diagnostics.cluster_kind(found, ENTRY) if found else None
+    if kind == diagnostics.THIS:
         report.check("cluster on PATH", True, found)
-    elif found:
+    elif kind == diagnostics.COPY:
         report.line("note", "cluster on PATH",
                     f"{found} is another copy; this one is {ENTRY}")
+    elif kind == diagnostics.OTHER:
+        report.line("note", "cluster on PATH",
+                    f"{diagnostics.other_cluster_name(found)}; a link that "
+                    "comes before it is offered at the end")
     else:
         report.line("off", "cluster on PATH", "not yet; offered at the end")
     return missing
 
 
 def _on_path():
-    """Offer to link ~/.local/bin/cluster here, if `cluster` is not on PATH."""
-    if shutil.which("cluster"):
+    """Offer to link ~/.local/bin/cluster here, if `cluster` is not on PATH.
+
+    A `cluster` that is some other program (Graphviz's) does not count: the
+    link is offered all the same, and must come before it on PATH.
+    """
+    found = shutil.which("cluster")
+    foreign = found if found and diagnostics.cluster_kind(found, ENTRY) == \
+        diagnostics.OTHER else None
+    if found and not foreign:
         return
     link = Path.home() / ".local" / "bin" / "cluster"
     if os.path.lexists(link) and link.resolve() != ENTRY.resolve():
@@ -109,10 +121,16 @@ def _on_path():
         link.parent.mkdir(parents=True, exist_ok=True)
         link.symlink_to(ENTRY)
         ui.info(f"linked {configcmd.tilde(link)} -> {ENTRY}")
-    if str(link.parent) not in os.environ.get("PATH", "").split(os.pathsep):
+    path = os.environ.get("PATH", "").split(os.pathsep)
+    add = (f"  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> "
+           f"{configcmd.tilde(_startup_file(interactive=False))}")
+    if str(link.parent) not in path:
         ui.say("~/.local/bin is not on PATH yet; for new shells, add it with:")
-        ui.say(f"  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> "
-               f"{configcmd.tilde(_startup_file(interactive=False))}")
+        ui.say(add)
+    elif foreign and shutil.which("cluster") != str(link):
+        ui.say(f"{diagnostics.other_cluster_name(foreign)}, and it comes before "
+               "~/.local/bin on PATH; for new shells, put ~/.local/bin first:")
+        ui.say(add)
 
 
 # --- which clusters, and their credentials ------------------------------------
