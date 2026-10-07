@@ -630,8 +630,13 @@ cluster clean --all              # every node in the pool, not just known ones
 `clean` kills only sessions that carry this tool's ownership tag naming a login
 that does not exist, and sessions you abandoned. Sessions tagged by another
 tool (`FOREIGN_OWNER_OPTIONS`) and untagged sessions are reported and left
-alone. `--force` also reaps foreign-tagged sessions and lets a sweep run while a
-pinned login is disconnected; untagged sessions need `--include-untagged`.
+alone. `--force` also reaps foreign-tagged sessions; untagged sessions need
+`--include-untagged`.
+
+A pinned login that is not connected is reconnected first, since only its own
+listing tells its sessions from orphans. If it cannot be reconnected, the sweep
+goes on without it: its sessions are kept (`--force` or not), its node is not
+visited, and `clean` exits 1 so the gap is visible.
 Sessions another machine started are never reaped, `--force` or not; see
 [Using more than one machine](#using-more-than-one-machine).
 

@@ -6,7 +6,7 @@ import argparse
 
 from .. import (backends, platform as plat, registry, strays as straylib,
                 tmuxlayer, ui, workstation)
-from ..auth import is_rejection
+from ..auth import failure_text, is_rejection, refused_by
 from ..command import command
 
 
@@ -397,9 +397,9 @@ def cmd_clean(ctx, args):
     parser.add_argument("--include-untagged", action="store_true",
                         help="also reap sessions carrying no ownership tag")
     parser.add_argument("--force", action="store_true",
-                        help="reap even foreign-tagged sessions, and sweep while "
-                             "a known login is disconnected (untagged sessions "
-                             "still need --include-untagged)")
+                        help="reap even foreign-tagged sessions, and those of "
+                             "logins unknown here (untagged sessions still need "
+                             "--include-untagged)")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="answer the stale-record prompt without asking")
     opts = parser.parse_args(args)
@@ -420,15 +420,7 @@ def clean_backend(ctx, opts):
     """One backend's sweep; *opts* carries `clean`'s parsed flags."""
     ctx.by_hand()
     known = set(ctx.state.known_logins())
-    inactive = [n for n in known
-                if ctx.state.pin_read(n) and not ctx.logins.is_active(n)]
-    if inactive and not opts.force:
-        ui.die(
-            f"login(s) {', '.join(sorted(inactive))} are pinned but not connected",
-            "their sessions cannot be told apart from orphans right now",
-            "reconnect them, or pass --force to sweep anyway "
-            "(which also reaps sessions tagged by other tools)",
-        )
+    unreached, refused = _reconnect_pinned(ctx, known)
 
     # Every session this machine knows about, on any node, is spared.
     protected = set()
@@ -510,20 +502,28 @@ def clean_backend(ctx, opts):
             ui.note("records kept; they are what restore-layout reads")
 
     targets = sweep_targets(ctx, everything=opts.all, crumbs=catalogued_crumbs)
+    # The node of a login that would not come back has just been asked once;
+    # visiting it directly would only ask again, for a node holding mostly
+    # that login's sessions, which are kept whatever the answer.
+    unreached_nodes = {ctx.backend.short(node) for node in unreached.values()}
+    targets = [node for node in targets
+               if _login_on(ctx, node)
+               or ctx.backend.short(node) not in unreached_nodes]
     if not targets:
         ui.say("nothing to sweep")
-        return 0
+        _report_unreached(ctx, unreached)
+        return 1 if unreached else 0
     ui.info(f"sweeping {len(targets)} node(s): "
             f"{', '.join(ctx.backend.short(n) for n in targets)}")
 
     killed, failed, kept = [], [], {"protected": [], "foreign": [], "untagged": [],
-                                    "unclaimed": [],
+                                    "unclaimed": [], "unreached": [],
                                     "stray": []}
     unreachable = []
     # A credential refused on one node is refused on every other, and each
     # try counts towards locking the account: after the first, the nodes a
     # login is on are still swept over it, and the rest are left.
-    refused, unvisited = "", []
+    unvisited = []
     # Whatever this sweep kills or spares, what a node should do for us may
     # have changed, so each node visited is settled — in the command that
     # lists it, and again in the one that kills, never in a round trip (on
@@ -547,7 +547,7 @@ def clean_backend(ctx, opts):
 
         abandoned_here = set(ctx.state.abandoned_on(short))
         doomed = _reapable(ctx, opts, short, rows, abandoned_here, protected,
-                           stray, known, kept)
+                           stray, known, kept, unreached)
         if opts.dry_run:
             killed += list(doomed.values())
             continue
@@ -592,6 +592,10 @@ def clean_backend(ctx, opts):
         ui.say(ui.yellow("kept (no ownership tag, cannot prove they are orphans): "
                          + ", ".join(sorted(kept['untagged']))))
         ui.note("pass --include-untagged to reap these too")
+    if kept["unreached"]:
+        ui.say(ui.yellow("kept (owned by a login that could not be reconnected): "
+                         + ", ".join(sorted(kept["unreached"]))))
+    _report_unreached(ctx, unreached)
     if unreachable:
         ui.warn("could not catalogue node(s), left untouched: "
                 + ", ".join(sorted(set(unreachable))))
@@ -608,7 +612,56 @@ def clean_backend(ctx, opts):
         ui.say("no reapable sessions found")
     for name in ctx.logins.active_names():
         ctx.tmux.crumb_sync(name)
-    return 1 if failed or unreachable or unvisited else 0
+    return 1 if failed or unreachable or unvisited or unreached else 0
+
+
+def _reconnect_pinned(ctx, known):
+    """Bring back every pinned login whose connection is down, for the sweep.
+
+    Only a login's own catalogue tells its sessions from orphans, and a pinned
+    login that is down still has its sessions on its node. Reconnecting costs
+    the authentication a visit to that node would cost anyway, and the sweep
+    then rides it. One that will not come back is swept around rather than
+    stopping the sweep: its sessions are kept, and its node is left alone.
+
+    Returns ``({login: pinned node}, refusal)`` for the logins that stayed
+    down, and the credential's refusal if that is why: after one, nothing
+    else on this backend is tried with it.
+    """
+    unreached, refused = {}, ""
+    for name in sorted(known):
+        node = ctx.state.pin_read(name)
+        if not node or ctx.logins.is_active(name):
+            continue
+        short = ctx.backend.short(node)
+        if refused:
+            unreached[name] = node
+            ui.warn(f"login '{name}' ({short}) not reconnected: the credential "
+                    "was refused, and would be again")
+            continue
+        ui.info(f"login '{name}' is pinned to {short} but not connected; "
+                "reconnecting it to tell its sessions from orphans")
+        try:
+            ctx.logins.ensure(name)
+        except SystemExit as exc:
+            unreached[name] = node
+            why = failure_text(exc, ctx.logins.last_failure)
+            ui.warn(f"could not reconnect login '{name}' ({why}); sweeping "
+                    f"without it, keeping its sessions and leaving {short} alone")
+            if refused_by(exc, ctx.logins.last_failure):
+                refused = why
+    return unreached, refused
+
+
+def _report_unreached(ctx, unreached):
+    """Close a sweep that went around logins it could not reconnect."""
+    if not unreached:
+        return
+    ui.warn("left unswept, as the login there could not be reconnected: "
+            + ", ".join(f"{ctx.backend.short(node)} ({name})"
+                        for name, node in sorted(unreached.items())))
+    for name in sorted(unreached):
+        ui.note(f"clean again once it is back: cluster login {name}")
 
 
 def sweep_targets(ctx, everything=False, crumbs=None):
@@ -646,10 +699,11 @@ def sweep_targets(ctx, everything=False, crumbs=None):
 
 
 def _reapable(ctx, opts, short, rows, abandoned_here, protected, stray, known,
-              kept):
+              kept, unreached=()):
     """``{session: label}`` of what `clean` reaps on one node.
 
     Everything spared is added to *kept* under the reason it was spared.
+    *unreached* are the logins that could not be reconnected for the sweep.
     """
     doomed = {}
     for row in rows:
@@ -673,6 +727,10 @@ def _reapable(ctx, opts, short, rows, abandoned_here, protected, stray, known,
             kept["untagged"].append(label)
         elif row.tagged and row.owner in known and ctx.logins.is_active(row.owner):
             kept["protected"].append(label)
+        # Its login is pinned and alive as far as anyone here knows; it just
+        # could not be asked. Not an orphan, --force or not.
+        elif row.tagged and row.owner in unreached:
+            kept["unreached"].append(label)
         # Owned by a login unknown here and claimed by no workstation: made
         # before workstation IDs, possibly by another machine sharing this
         # home. Not provably an orphan of this one.

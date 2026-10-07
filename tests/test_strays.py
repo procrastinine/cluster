@@ -70,6 +70,78 @@ class TestCleanCatalogueSafety(unittest.TestCase):
         self.assertIn("did not touch any sessions or breadcrumbs", out.getvalue())
 
 
+class TestCleanReconnectsPinnedLogins(unittest.TestCase):
+    """A pinned login that is down is brought back for the sweep, and one that
+    will not come back is swept around, never guessed at."""
+
+    def sweep(self, connects, **flags):
+        """main up on holylogin06; `project` pinned to holylogin05 and down,
+        reconnecting as *connects* says. Both nodes hold sessions."""
+        from types import SimpleNamespace
+        from clustertool import ui
+
+        pins = {"main": "holylogin06.rc", "project": "holylogin05.rc"}
+        active = {"main"}
+        tried = []
+
+        def ensure(name):
+            tried.append(name)
+            if not connects:
+                ctx.logins.last_failure = "holylogin05 not accepting connections"
+                ui.die("could not open login 'project'")
+            active.add(name)
+            return True
+
+        def tagged(name, owner):
+            return SimpleNamespace(name=name, owner=owner, foreign="", tagged=True,
+                                   attached=False, windows="1",
+                                   workstation=workstation.ident())
+
+        # `stale` is project's, on a node it does not live on: still not junk.
+        listed = {"main": [tagged("old", "gone"), tagged("stale", "project")],
+                  "project": [tagged("work", "project"), tagged("junk", "gone")]}
+        visited, killed = [], []
+        ctx = clean_ctx(
+            ledger=["holylogin05.rc"],
+            list_sessions_checked=lambda name, settle=False: (True, listed[name]),
+            list_sessions_direct_checked=lambda node, settle=False: (
+                visited.append(node) or (True, listed["project"])),
+            kill_sessions=lambda login, names, settle=False: (
+                killed.extend(names) or (list(names), [])))
+        ctx.state.known_logins = lambda: sorted(pins)
+        ctx.state.pin_read = pins.get
+        ctx.logins.is_active = lambda name: name in active
+        ctx.logins.active_names = lambda: sorted(active)
+        ctx.logins.node_of = pins.get
+        ctx.logins.ensure = ensure
+        ctx.logins.last_failure = ""
+        out = io.StringIO()
+        from clustertool.commands.maintenance import clean_backend
+        opts = SimpleNamespace(force=False, all=False, all_backends=False,
+                               dry_run=False, include_untagged=False, yes=False)
+        vars(opts).update(flags)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = clean_backend(ctx, opts)
+        return rc, tried, visited, sorted(killed), out.getvalue()
+
+    def test_a_down_login_is_reconnected_and_its_node_swept_over_it(self):
+        rc, tried, visited, killed, _ = self.sweep(connects=True)
+        self.assertEqual((rc, tried, visited), (0, ["project"], []))
+        self.assertEqual(killed, ["junk", "old"])
+
+    def test_one_that_stays_down_is_swept_around_not_waited_for(self):
+        for flags in ({}, {"force": True}):
+            with self.subTest(**flags):
+                rc, tried, visited, killed, out = self.sweep(connects=False, **flags)
+                self.assertEqual(tried, ["project"])
+                # Its node was just asked; it is not asked again, and nothing
+                # of the login's is touched — the rest is still swept.
+                self.assertEqual((visited, killed), ([], ["old"]))
+                self.assertEqual(rc, 1)
+                self.assertIn("holylogin05 (project)", out)
+                self.assertIn("could not be reconnected): holylogin06:stale", out)
+
+
 class TestStrayRecords(unittest.TestCase):
     """Sessions recorded on nodes no login occupies.
 
