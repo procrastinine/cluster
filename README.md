@@ -87,6 +87,26 @@ choose the cluster, and the default is the only one set up, else `fasrc`
 outlive the login's connection, because `cluster` keeps linger on there; see
 [USAGE.md](USAGE.md#keeping-tmux-alive-after-you-disconnect-fasrc).
 
+## AI agents (optional)
+
+[`skills/cluster/`](skills/cluster/SKILL.md) is an [Agent Skills](https://agentskills.io)
+skill that teaches a coding agent (Claude Code, Codex, Pi and others) to use
+`cluster`: what costs an authentication, which commands need your yes first,
+and how to run and read sessions without a terminal. Install it if you want
+agents to drive your clusters:
+
+```bash
+npx skills add procrastinine/cluster -g     # asks which agents to install it for
+```
+
+Or link it by hand, so it stays current with `git pull`:
+
+```bash
+mkdir -p ~/.agents/skills ~/.claude/skills
+ln -s ~/cluster/skills/cluster ~/.agents/skills/cluster   # Codex, Pi and others
+ln -s ~/cluster/skills/cluster ~/.claude/skills/cluster   # Claude Code
+```
+
 ## What/Where
 
 | What | Where |

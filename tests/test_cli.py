@@ -758,5 +758,55 @@ class TestTransferCommandLine(unittest.TestCase):
         self.assertNotIn("rsync", err.getvalue())
 
 
+
+class TestAgentSkill(unittest.TestCase):
+    """skills/cluster/SKILL.md, the instructions agents install, against the CLI.
+
+    Agents follow it literally, so a command or flag it names that the CLI no
+    longer has would be run anyway, and fail in front of the user.
+    """
+
+    SKILL = Path(__file__).resolve().parent.parent / "skills" / "cluster" / "SKILL.md"
+
+    def test_its_front_matter_is_what_agents_load(self):
+        import re
+
+        head = self.SKILL.read_text(encoding="utf-8").split("---\n")[1]
+        fields = dict(line.split(": ", 1) for line in head.splitlines())
+        self.assertEqual(fields["name"], self.SKILL.parent.name)
+        self.assertRegex(fields["name"], r"^[a-z0-9]+(-[a-z0-9]+)*$")
+        self.assertLessEqual(len(fields["description"]), 1024)
+        self.assertLessEqual(len(fields["compatibility"]), 500)
+        self.assertFalse(re.search(r"[:#]\s", fields["description"]),
+                         "plain YAML: no ': ' or ' #' in an unquoted value")
+
+    def test_every_command_and_flag_it_names_exists(self):
+        import re
+
+        text = self.SKILL.read_text(encoding="utf-8")
+        lines = re.findall(r"`(cluster [^`]+)`", text)
+        for block in re.findall(r"```bash\n(.*?)```", text, re.S):
+            lines += [line.split("  #")[0] for line in block.splitlines()
+                      if line.startswith("cluster ")]
+        checked = 0
+        for line in lines:
+            words = line.split()[1:]
+            words = words[:words.index("--")] if "--" in words else words
+            # `cluster --help`, and placeholders such as `cluster COMMAND`.
+            if not words or words[0].startswith("-") or words[0].isupper():
+                continue
+            with self.subTest(line=line):
+                self.assertIn(words[0], cli.COMMANDS)
+                options = {flag.strip()
+                           for flags, _ in cli.declared_options(cli.COMMANDS[words[0]])
+                           for flag in flags.split(",")}
+                options |= {"--nersc", "--fasrc", "--backend"}
+                for word in words[1:]:
+                    if word.startswith("-"):
+                        self.assertIn(word, options)
+                checked += 1
+        self.assertGreater(checked, 20)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

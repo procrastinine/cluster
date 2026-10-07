@@ -44,6 +44,7 @@ remote/hooks.example.py      an example project hooks file for the companion
 remote/mirror.exclude        default excludes for the companion's code mirror
 completions/cluster.bash     completion for bash 3.2+ and zsh (local state only)
 extras/                      optional tools and systemd units that use cluster
+skills/cluster/SKILL.md      instructions for coding agents that use cluster
 docs/                        setup, file inventory, design notes, the NERSC bridge
 tests/test_*.py              unit tests, one module per subject; no cluster needed
 tests/support.py             the test sandbox and helpers shared by the test modules
@@ -213,6 +214,9 @@ for a FASRC hub driving NERSC.
   or moves one updates it.
 - `docs/design.md` holds rationale, site behaviour and dated measurements.
 - `docs/nersc-bridge.md` covers the bridge and the `nersc` companion.
+- `skills/cluster/SKILL.md` tells coding agents how to use the tool. When a
+  command or flag it names changes, update it; `tests/test_cli.py` checks
+  that every one it names exists.
 
 Write the present state: what the tool does and why, not how it came to do it.
 
