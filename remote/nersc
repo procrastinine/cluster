@@ -25,11 +25,17 @@ Verbs:
                       submit AND register the run dir for automatic return to
                       this cluster when the job finishes (run dir defaults to --chdir)
   track [--cleanup] JOBID SRC [DEST]   register an already-submitted job
+  untrack [--dry-run] (--forgotten | JOBID ...)
+                      set queue entries aside in the registry's untracked/:
+                      the named jobs, or every job tracked over 7 days ago
+                      that Slurm's accounting does not know (reap never
+                      could act on those); moving one back tracks it again
   reap [--list] [--max-seconds=N]
                       one idempotent pass: pull finished tracked run dirs back
                       here atomically (run it periodically, e.g. from cron);
                       with N, no new pull starts after N seconds (0: no
-                      limit, the default); SIGTERM ends a pass cleanly
+                      limit, the default); SIGTERM ends a pass cleanly;
+                      jobs whose pull failed last time are tried last
   q / jobs            compact `squeue --me` snapshot
   peek JOBID [FILE] [-n N]   inspect a job from here: state + run-dir listing +
                       tail of its output (or FILE) — no paths needed
@@ -45,7 +51,8 @@ Verbs:
   submit ARGS         the project's default form, when a hooks file defines one
   status [--quick]    health: certificate, connection, jobs, mirror age
                       (--quick: this machine only, no remote call)
-  doctor              probe connectivity end to end
+  doctor              probe connectivity end to end, and name a scratch
+                      storage target that stopped answering
   config              the effective configuration, key by key
   cert                certificate validity
   connect/disconnect  explicit master control (normally automatic)
@@ -69,7 +76,7 @@ from datetime import datetime
 from pathlib import Path
 from stat import S_ISDIR as stat_is_dir, S_ISLNK as stat_is_link
 
-VERSION = "2.1"
+VERSION = "2.2"
 
 # Editing the installed copy in place is safe: `cluster bridge push` compares
 # it with what it last installed before shipping anything, and never overwrites
@@ -885,7 +892,9 @@ def _stall_report(label, silence, capture, last_line=None, seen_bytes=0):
         "            would still be streaming).\n"
         "  effect  : %s The tool continues; nothing is left half-waiting.\n"
         "  next    : retry when storage is healthy, or set\n"
-        "            NERSC_NO_PROGRESS_SECONDS=0 to wait indefinitely.\n"
+        "            NERSC_NO_PROGRESS_SECONDS=0 to wait indefinitely;\n"
+        "            `nersc doctor` names a storage target that stopped\n"
+        "            answering.\n"
         % (int(silence), label, _describe_endpoint(),
            ("%d bytes; last thing that worked: %s"
             % (seen_bytes, last_line[:120])) if last_line else
@@ -2085,29 +2094,73 @@ def cmd_track(rest):
                            dest=rest[2] if len(rest) == 3 else None, cleanup=cleanup)
 
 
+#: Longest one return-queue file may take to be read before the listing
+#: passes over it, and never more than half of no_progress_seconds; see
+#: _read_queue.
+QUEUE_FILE_SECONDS = 30
+
+#: Queue files in a row that may give nothing before the listing stops.  A
+#: dead storage target holds a scattered few of them, so a run of misses
+#: means NERSC storage as a whole is not answering.
+QUEUE_MISSES_IN_A_ROW = 3
+
+#: The listing's exit code when it stops after QUEUE_MISSES_IN_A_ROW misses.
+QUEUE_STORAGE_DOWN_RC = 75
+
+
 def _read_queue():
     rq = return_queue_dir()
-    # Each file is ANNOUNCED (AT) before it is opened and echoed (OK) after it
-    # is read.  The announcement is what makes a hang locatable: if the listing
-    # goes silent, the last AT names the exact file whose read never returned,
-    # which no amount of after-the-fact inspection could recover.
+    # Each file is ANNOUNCED (AT) before anything touches it, and echoed (OK)
+    # after it is read.  The announcement is what makes a hang locatable: if
+    # the listing goes silent, the last AT names the exact file whose read
+    # never returned.  Nothing may come before it, not even a stat: on Lustre
+    # a stat asks the object storage targets holding the file for its size,
+    # so a file with an object on a target that has stopped answering hangs
+    # the stat itself.  (pscratch OST 61, 8 October 2026: a `[ -e "$f" ]`
+    # ahead of the announcement hung every pass "between files".)
+    #
+    # Each read is bounded and then killed, so such a file is reported (SKIP)
+    # and passed over instead of ending the listing for every file after it,
+    # which in name order were the newest jobs.  A kill that cannot land
+    # leaves the progress guard to end the listing, as before.  Reads are
+    # unbounded only when abandonment is off (no_progress_seconds = 0) or
+    # NERSC has no `timeout`.
+    limit = no_progress_seconds()
+    bound = max(1, int(min(QUEUE_FILE_SECONDS, limit / 2))) if limit else 0
     code, out = remote_out(
         ["bash", "-c",
+         'set -o pipefail; shopt -s nullglob; '
          'cd %s/queue 2>/dev/null || exit 0; '
-         'for f in *.json; do [ -e "$f" ] || exit 0; '
-         'printf "AT\\t%%s\\n" "$f"; '
-         'printf "OK\\t%%s\\t" "$f"; tr -d "\\n" < "$f"; echo; done'
-         % shlex.quote(rq)])
+         'read_file="cat --"; '
+         'if [ %d -gt 0 ] && command -v timeout >/dev/null 2>&1; then '
+         'read_file="timeout -s KILL %d cat --"; fi; '
+         'misses=0; '
+         'for f in *.json; do printf "AT\\t%%s\\n" "$f"; '
+         'if body=$($read_file "$f" 2>/dev/null | tr -d "\\n"); then '
+         'misses=0; printf "OK\\t%%s\\t%%s\\n" "$f" "$body"; '
+         'else rc=$?; printf "SKIP\\t%%s\\t%%d\\n" "$f" "$rc"; '
+         'case $rc in 124|137) misses=$((misses + 1));; esac; '
+         '[ "$misses" -lt %d ] || exit %d; fi; done'
+         % (shlex.quote(rq), bound, bound, QUEUE_MISSES_IN_A_ROW,
+            QUEUE_STORAGE_DOWN_RC)])
     entries = []
     announced = []
+    answered = set()
+    skipped = []
     for line in out.splitlines():
         if line.startswith("AT\t"):
             announced.append(line[3:])
+            continue
+        if line.startswith("SKIP\t"):
+            fname, _, rc = line[5:].partition("\t")
+            answered.add(fname)
+            skipped.append((fname, rc))
             continue
         if not line.startswith("OK\t"):
             continue
         rest = line[3:]
         fname, _, payload = rest.partition("\t")
+        answered.add(fname)
         try:
             record = json.loads(payload)
         except ValueError:
@@ -2123,22 +2176,38 @@ def _read_queue():
             continue
         record["_file"] = fname
         entries.append(record)
+    if skipped:
+        sys.stderr.write(
+            "nersc: %d return-queue entr%s could not be read; %s on a later "
+            "pass:\n" % (len(skipped), "y" if len(skipped) == 1 else "ies",
+                         "it is read again" if len(skipped) == 1
+                         else "they are read again"))
+        for fname, rc in skipped:
+            sys.stderr.write(
+                "  %s: %s\n"
+                % (fname, "gave nothing for %ds; the storage holding it is "
+                          "not answering" % bound if rc in ("124", "137")
+                   else "could not be read (rc=%s)" % rc))
+        sys.stderr.flush()
     if code != 0:
         # Never silent, and never fatal: the listing is its own progress
         # signal, so whatever streamed through is still actionable and the
         # pass continues with it.  The pass is idempotent, so anything missed
         # simply returns next time.
-        read_names = set(r["_file"] for r in entries)
-        stuck = [name for name in announced if name not in read_names]
+        if code == QUEUE_STORAGE_DOWN_RC:
+            where = ("cause   : %d entries in a row gave nothing, so NERSC "
+                     "storage looks down" % QUEUE_MISSES_IN_A_ROW)
+        else:
+            stuck = [name for name in announced if name not in answered]
+            where = "stuck on: %s" % (stuck[0] if stuck else
+                                      "unknown (it stopped between files)")
         sys.stderr.write(
             "nersc: the return-queue listing stopped early (rc=%d).\n"
             "  read    : %d entr%s\n"
-            "  stuck on: %s\n"
-            "  effect  : continuing with what was read; the rest return on a\n"
-            "            later pass once that file is readable again.\n"
-            % (code, len(entries), "y" if len(entries) == 1 else "ies",
-               stuck[0] if stuck else
-               "unknown (it stopped between files)"))
+            "  %s\n"
+            "  effect  : continuing with what was read; the rest are read\n"
+            "            again on the next pass.\n"
+            % (code, len(entries), "y" if len(entries) == 1 else "ies", where))
         sys.stderr.flush()
     return entries
 
@@ -2251,21 +2320,71 @@ def _job_states(job_ids, strict=True):
 
 
 def _seen_path():
+    """{queue file: when its job was first seen terminal}; see cmd_reap."""
     return STATE_DIR / "reap-seen.json"
 
 
-def _load_seen():
+def _failed_path():
+    """{queue file: when its last pull failed}; see cmd_reap."""
+    return STATE_DIR / "reap-failed.json"
+
+
+def _load_state(path):
     try:
-        return json.loads(_seen_path().read_text())
+        value = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
+    return value if isinstance(value, dict) else {}
 
 
-def _save_seen(seen):
+def _save_state(path, value):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = _seen_path().with_name(".reap-seen.tmp")
-    tmp.write_text(json.dumps(seen))
-    os.rename(str(tmp), str(_seen_path()))
+    tmp = path.with_name("." + path.stem + ".tmp")
+    tmp.write_text(json.dumps(value))
+    os.rename(str(tmp), str(path))
+
+
+def _queue_key(entry):
+    """A queue entry's identity: its file, since one Slurm id may own several."""
+    return entry.get("_file", entry["job"])
+
+
+#: Days a tracked job may stay unknown to Slurm's accounting before `untrack
+#: --forgotten` sets its entry aside; see _forgotten.
+FORGOTTEN_AFTER_DAYS = 7
+
+
+def _tracked_at(entry):
+    """When *entry* was registered, as a Unix time, or None if it does not say."""
+    try:
+        value = float(entry.get("tracked_at"))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _forgotten(entries, states, now):
+    """The entries reap can never act on.
+
+    Their job is absent from *states*, the answer of a sacct query that
+    succeeded, so accounting has no row for it, and it was registered over
+    FORGOTTEN_AFTER_DAYS ago.  A job registered more recently may just not
+    have reached the accounting database yet.  An entry that does not say
+    when it was registered is never counted: only naming it untracks it.
+    """
+    cutoff = now - FORGOTTEN_AFTER_DAYS * 86400
+    return [entry for entry in entries
+            if entry["job"] not in states
+            and (_tracked_at(entry) or now) < cutoff]
+
+
+def _report_forgotten(entries, states):
+    forgotten = _forgotten(entries, states, time.time())
+    if forgotten:
+        print("      %d tracked job%s unknown to Slurm's accounting for over "
+              "%d days; `nersc untrack --forgotten` sets %s aside"
+              % (len(forgotten), "" if len(forgotten) == 1 else "s",
+                 FORGOTTEN_AFTER_DAYS, "it" if len(forgotten) == 1 else "them"))
 
 
 #: The least reap_lock_stale_seconds is taken to be: twenty ticks, and a
@@ -2606,11 +2725,21 @@ def cmd_reap(args):
         print("nothing tracked")
         return 0
     states = _job_states(sorted({e["job"] for e in entries}))
+    # A pull that failed, as one does on a file whose storage on NERSC has
+    # stopped answering, is likely to fail again, and each failure costs a
+    # whole rsync --timeout.  Those jobs go after every other, oldest failure
+    # first, so they cannot spend a pass's budget before the rest are tried.
+    # (Two such jobs failed about fifty times each on 17-18 September 2026,
+    # three minutes apiece, at the head of every pass.)
+    failed_before = _load_state(_failed_path())
+    entries.sort(key=lambda e: failed_before.get(_queue_key(e), 0))
     for entry in entries:
-        print("%s  %-12s  %s -> %s%s" % (
+        print("%s  %-12s  %s -> %s%s%s" % (
             entry["job"], states.get(entry["job"], "UNKNOWN"), entry["src"],
-            entry["dest"], "  [cleanup]" if entry.get("cleanup") else ""))
+            entry["dest"], "  [cleanup]" if entry.get("cleanup") else "",
+            "  [last pull failed]" if _queue_key(entry) in failed_before else ""))
     if list_only:
+        _report_forgotten(entries, states)
         return 0
     lock = _reap_lock()
     if lock is None:
@@ -2618,9 +2747,12 @@ def cmd_reap(args):
         return 0
     started = time.time()
     returned, failed, waiting, unclean = [], [], [], []
-    seen, stopped = None, None
+    seen, pull_failed, stopped = None, None, None
     try:
-        seen, now = _load_seen(), int(time.time())
+        seen, now = _load_state(_seen_path()), int(time.time())
+        # Marks of entries no longer queued are dropped with them.
+        pull_failed = dict((_queue_key(e), failed_before[_queue_key(e)])
+                           for e in entries if _queue_key(e) in failed_before)
         rq = return_queue_dir()
         ON_TICK = lambda: _touch_lock(lock)  # noqa: E731
         for entry in entries:
@@ -2628,7 +2760,7 @@ def cmd_reap(args):
             job, state = entry["job"], states.get(entry["job"], "UNKNOWN")
             # A job may own several independently returned roots.  Queue-file
             # identity, not the shared Slurm id, is the debounce identity.
-            seen_key = entry.get("_file", job)
+            seen_key = _queue_key(entry)
             if not is_terminal(state):
                 seen.pop(seen_key, None)
                 waiting.append("%s (%s)" % (job, state))
@@ -2645,7 +2777,9 @@ def cmd_reap(args):
                 break
             if not _pull_run_dir(entry, state):
                 failed.append(job)
+                pull_failed[seen_key] = int(time.time())
                 continue
+            pull_failed.pop(seen_key, None)
             # What to delete once the entry is retired, if anything.  The
             # path is checked again here, at use time, because a queue entry
             # written directly by code on NERSC never went through
@@ -2702,7 +2836,9 @@ def cmd_reap(args):
             # stopped (a scheduler's time limit) would forget each first
             # sighting of a finished job and never act on one.
             if seen is not None:
-                _save_seen(seen)
+                _save_state(_seen_path(), seen)
+            if pull_failed is not None:
+                _save_state(_failed_path(), pull_failed)
         finally:
             try:
                 lock.rmdir()
@@ -2718,12 +2854,119 @@ def cmd_reap(args):
     if unclean:
         print("      returned, but not cleaned off scratch (see above): %s"
               % ", ".join(unclean))
+    _report_forgotten(entries, states)
     if stopped is not None:
         print("      stopped by %s part way through; a pull it cut short "
               "resumes next pass" % _signal_name(stopped))
         sys.stdout.flush()
         raise stopped
     return 1 if failed or unclean else 0
+
+
+UNTRACK_USAGE = "usage: nersc untrack [--dry-run] (--forgotten | JOBID ...)"
+
+#: Queue files one remote `mv` moves; see _move_aside.
+UNTRACK_BATCH = 200
+
+
+def _move_aside(rq, entries):
+    """Move *entries*' files from queue/ to untracked/; how many moved.
+
+    A move is a rename on NERSC's metadata server, so it works even for a
+    file whose storage target has stopped answering.  ``mv -v`` prints a
+    line per file for the progress guard, and ``--backup=numbered`` keeps an
+    entry of the same name untracked earlier.
+    """
+    names = [entry["_file"] for entry in entries]
+    moved = 0
+    for start in range(0, len(names), UNTRACK_BATCH):
+        batch = names[start:start + UNTRACK_BATCH]
+        code, count = remote_count(
+            ["bash", "-c",
+             'mkdir -p "$1/untracked" && cd "$1/queue" && shift && '
+             'exec mv -v --backup=numbered -t ../untracked -- "$@"',
+             "untrack", rq] + batch)
+        moved += count
+        if code != 0:
+            sys.stderr.write("nersc: moving %d queue entr%s aside FAILED part "
+                             "way (rc=%d); %d of them moved\n"
+                             % (len(batch), "y" if len(batch) == 1 else "ies",
+                                code, count))
+    return moved
+
+
+def _untrack(jobs, forgotten, dry_run):
+    entries = _read_queue()
+    missing, left = [], 0
+    if forgotten:
+        states = _job_states(sorted({e["job"] for e in entries}))
+        chosen = _forgotten(entries, states, time.time())
+        left = sum(1 for e in entries if e["job"] not in states) - len(chosen)
+    else:
+        wanted = set(jobs)
+        chosen = [e for e in entries if e["job"] in wanted]
+        missing = sorted(wanted - set(e["job"] for e in chosen))
+    for job in missing:
+        sys.stderr.write("nersc: %s is not in the return queue\n" % job)
+    for entry in chosen:
+        when = _tracked_at(entry)
+        print("%s %s  %s -> %s%s" % (
+            "would untrack" if dry_run else "untracking", entry["job"],
+            entry["src"], entry["dest"],
+            "  (tracked %s)" % datetime.fromtimestamp(when).strftime("%Y-%m-%d")
+            if when else ""))
+    if left:
+        print("%d more unknown to accounting were tracked in the last %d days, "
+              "or do not say when; they stay queued unless named"
+              % (left, FORGOTTEN_AFTER_DAYS))
+    if not chosen:
+        print("nothing to untrack")
+    if dry_run or not chosen:
+        return 1 if missing else 0
+    rq = return_queue_dir()
+    moved = _move_aside(rq, chosen)
+    print("untracked %d of %d entr%s into %s/untracked/; moving one back into "
+          "%s/queue/ tracks it again"
+          % (moved, len(chosen), "y" if len(chosen) == 1 else "ies", rq, rq))
+    return 0 if moved == len(chosen) and not missing else 1
+
+
+def cmd_untrack(args):
+    """Set return-queue entries aside, in the registry's untracked/.
+
+    For entries reap can never act on (--forgotten; see _forgotten), or ones
+    that should not come back after all.  Nothing is deleted: moving a file
+    back from untracked/ into queue/ tracks it again.  The reap lock is held
+    while entries move, so no pass is part way through one that disappears.
+    """
+    global ON_TICK
+    args = list(args)
+    dry_run = "--dry-run" in args
+    forgotten = "--forgotten" in args
+    jobs = [arg for arg in args if arg not in ("--dry-run", "--forgotten")]
+    for arg in jobs:
+        if not JOB_ID_RE.match(arg):
+            die("untrack does not take %r" % arg, UNTRACK_USAGE)
+    if forgotten and jobs:
+        die("--forgotten chooses the entries itself; do not also name jobs",
+            UNTRACK_USAGE)
+    if not forgotten and not jobs:
+        die("name the jobs to untrack, or pass --forgotten", UNTRACK_USAGE)
+    lock = None
+    if not dry_run:
+        lock = _reap_lock()
+        if lock is None:
+            die("a reap pass is running; untrack once it has finished")
+        ON_TICK = lambda: _touch_lock(lock)  # noqa: E731
+    try:
+        return _untrack(jobs, forgotten, dry_run)
+    finally:
+        ON_TICK = None
+        if lock is not None:
+            try:
+                lock.rmdir()
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------
@@ -3040,6 +3283,9 @@ def cmd_doctor(args):
         code, out = remote_out(["bash", "-lc", "echo scratch=$PSCRATCH"])
         if code == 0:
             print("remote %s" % out.strip().splitlines()[-1])
+        line, bad = check_scratch_storage()
+        print(line)
+        problems += bad
         if env_parity_enabled():
             local_env, remote_env = check_env_parity()
             print("env parity (live installed-distribution metadata):")
@@ -3064,6 +3310,64 @@ def cmd_doctor(args):
     print(line)
     problems += bad
     return 1 if problems else 0
+
+
+#: Seconds `nersc doctor` gives `lfs df` to hear from every storage target.
+LFS_DF_SECONDS = 15
+
+
+def describe_lfs_df(out, lfs_rc):
+    """(doctor line, 1 if a storage target is not answering, else 0) from
+    a bounded `lfs df` of scratch: what it printed, and its exit code.
+
+    Lustre keeps a file's contents on object storage targets (OSTs).  When
+    one stops answering, every stat or read of a file with an object there
+    hangs, which the progress guard sees as a silent remote command
+    (pscratch OST 61, 8 October 2026).  `lfs df` lists the targets in index
+    order and blocks at the first that does not answer, so when it has to be
+    killed, the target after the last one it printed is the culprit.
+    """
+    inactive = sorted(int(index, 16) for index in re.findall(
+        r"OST([0-9a-fA-F]{4})_UUID\s*:\s*inactive device", out))
+    note = ("; inactive: %s" % ", ".join("OST %d" % i for i in inactive)
+            if inactive else "")
+    if lfs_rc == 0 and "filesystem_summary" in out:
+        return "scratch storage: every target answered%s" % note, 0
+    if lfs_rc not in (124, 137):
+        return "scratch storage: not checked (lfs df rc=%d)" % lfs_rc, 0
+    targets = re.findall(r"\[(MDT|OST):(\d+)\]", out)
+    if targets and targets[-1][0] == "OST":
+        culprit = "OST %d" % (int(targets[-1][1]) + 1)
+        where = "after OST %s" % targets[-1][1]
+    elif targets:
+        culprit, where = "a storage target", "after MDT %s" % targets[-1][1]
+    else:
+        culprit, where = "a storage target", "before printing any target"
+    return ("scratch storage: %s is NOT ANSWERING (lfs df stopped %s, and was "
+            "killed after %ds)%s\n"
+            "  -> any stat or read of a file stored there hangs until it "
+            "answers again;\n"
+            "     reap passes over such queue entries, and pulls of run dirs "
+            "holding\n"
+            "     such files stall" % (culprit, where, LFS_DF_SECONDS, note)), 1
+
+
+def check_scratch_storage():
+    """(doctor line, 1 if a scratch storage target is not answering, else 0)."""
+    scratch = (CFG.get("scratch") or "").strip()
+    if not scratch:
+        return "scratch storage: not checked (no `scratch` configured)", 0
+    code, out = remote_out(
+        ["bash", "-c",
+         'command -v lfs >/dev/null 2>&1 || exit 3; '
+         'timeout -s KILL %d lfs df %s 2>&1; printf "LFSDF_RC\\t%%s\\n" "$?"'
+         % (LFS_DF_SECONDS, shlex.quote(scratch))])
+    if code == 3:
+        return "scratch storage: not checked (NERSC has no lfs)", 0
+    match = re.search(r"^LFSDF_RC\t(\d+)$", out, re.M)
+    if not match:
+        return "scratch storage: not checked (rc=%d)" % code, 0
+    return describe_lfs_df(out, int(match.group(1)))
 
 
 def describe_hooks():
@@ -3096,6 +3400,8 @@ def main(argv):
         return cmd_sbatch(rest)
     if verb == "track":
         return cmd_track(rest)
+    if verb == "untrack":
+        return cmd_untrack(rest)
     if verb == "reap":
         return cmd_reap(rest)
     if verb == "peek":

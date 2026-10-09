@@ -145,9 +145,9 @@ multiplexed SSH connection to NERSC and opens it on demand.
 | `push SRC DEST`, `pull SRC DEST` | rsync between the hub and NERSC through a DTN, or over the login connection when no DTN answers; NERSC paths are relative to your NERSC home, and rsync options pass through (`--exclude PAT` and `--exclude=PAT` alike). A lost connection is resumed (see `connect_retries`) |
 | `sync [--dry-run]` | mirror `mirror_src` to `mirror_dest`, one way, with `--delete`; other rsync options pass through |
 | `submit ...` | sync, then run a command in the mirror; see below |
-| `sbatch --return ...`, `track`, `reap`, `fetch`, `peek` | the job return loop; see below |
+| `sbatch --return ...`, `track`, `untrack`, `reap`, `fetch`, `peek` | the job return loop; see below |
 | `status [--quick]` | the certificate, the connection, your jobs and the mirror's age; `--quick` asks nothing of NERSC |
-| `doctor` | probes connectivity end to end and checks the configuration |
+| `doctor` | probes connectivity end to end, checks the configuration, and names a scratch storage target that has stopped answering (see below) |
 | `config` | the effective configuration, key by key |
 | `cert` | certificate validity |
 | `connect`, `disconnect` | explicit control of the connection (normally automatic) |
@@ -217,7 +217,7 @@ lock is `sync.lock` in the connection directory (see below).
 | `mirror.exclude`, next to the config | rsync exclude patterns for `sync` |
 | `~/.local/state/nersc/` | the last sync time, the DTN it last used, and the return loop's bookkeeping and lock; `NERSC_STATE_DIR` moves it |
 | `$XDG_RUNTIME_DIR/nersc/`, else `/tmp/nersc-<uid>/` | the connection's socket, lock and log, and `sync.lock`, on the node's local disk |
-| on NERSC: `$PSCRATCH/.nersc-return/` | the return registry, `queue/` and `done/` (see `return_queue`) |
+| on NERSC: `$PSCRATCH/.nersc-return/` | the return registry, `queue/`, `done/` and `untracked/` (see `return_queue`) |
 | on NERSC: `~/<mirror_dest>` | the code mirror |
 
 The connection directory must be a real directory you own with mode 700. The
@@ -305,6 +305,32 @@ to it, or `include_prefixes`, whose entries also match names that continue
 after a dot (`model` returns `model.pt` and `model.json` too). A record that
 cannot be read, or that lacks `job`, `src` or `dest`, is reported and skipped.
 
+Each record is read with a time limit of 30 seconds, or half of
+`no_progress_seconds` when that is shorter. Reading a file whose
+storage on NERSC has stopped answering does not fail. It waits, so a
+record that is still unread when the limit runs out is reported by name
+and skipped until the next pass, and the records after it are still
+read. When three records in a row run out of time, the read stops,
+because the fault is then likely to affect most of scratch rather than
+a few files. With `no_progress_seconds = 0`, reads have no limit.
+
+When one of scratch's Lustre object storage targets (OSTs) stops
+answering, a stat or read of any file stored on it hangs. That happened
+to pscratch OST 61 on 8 October 2026. Before this limit existed, one
+such record ended every pass's read of the queue, and no records after
+it returned. `nersc doctor` checks for such a target: it gives `lfs df`
+15 seconds to report every target of scratch, and when it has to be
+killed, names the one after the last it printed:
+
+```
+scratch storage: OST 61 is NOT ANSWERING (lfs df stopped after OST 60, and was killed after 15s)
+```
+
+Files stored there cannot be read by any route, since the data transfer
+nodes see the same targets, so they wait on NERSC until it answers. To
+list a tree without touching them, read metadata only and leave that
+target out: `lfs find DIR -t f ! --ost 61`.
+
 `nersc reap` does one pass over the registry. Run it periodically on the hub,
 from cron or from a long-running watcher job:
 
@@ -338,7 +364,28 @@ A job must look terminal on two consecutive passes before it is returned, so a
 job that requeues itself on timeout is not pulled mid-resurrection. A fresh
 destination is written as `DEST.nersc-part` and renamed into place when
 complete; an existing one is updated incrementally. A failed pull stays in the
-queue and resumes on the next pass.
+queue and resumes on the next pass, after every other job: a pull that
+failed is likely to fail again, as one does on a file whose storage on NERSC
+has stopped answering, and each failure costs `no_progress_seconds` of
+silence. `reap --list` marks such a job `[last pull failed]`.
+
+A job that Slurm's accounting has no record of stays `UNKNOWN`, which is not
+terminal, so reap can never act on its entry. (A never-started array element
+is not one of these: reap finds it under its array's own record.) A pass names those registered more than seven days ago, and
+`untrack` sets entries aside:
+
+```bash
+nersc untrack --forgotten --dry-run   # what it would set aside
+nersc untrack --forgotten             # every job unknown to accounting, tracked over 7 days ago
+nersc untrack 12345678 12345679_3     # these jobs, whatever their state
+```
+
+Nothing is deleted. Each entry moves to the registry's `untracked/`, where an
+earlier entry of the same name is kept as a numbered backup (`X.json.~1~`),
+and moving it back into `queue/` tracks it again. `--forgotten` leaves an
+entry that does not record when it was registered (`tracked_at`); name its
+job instead. While a reap pass is running, `untrack` refuses rather than
+move an entry the pass may be working on.
 
 `--cleanup` removes the NERSC copy after a successful return:
 

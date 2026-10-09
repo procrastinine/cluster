@@ -525,6 +525,69 @@ class TestNerscTool(unittest.TestCase):
         for name in ("2.json", "3.json", "4.json"):
             self.assertIn("skipping malformed queue entry %s" % name, err.getvalue())
 
+    def test_a_stalled_queue_listing_names_the_file_it_stopped_on(self):
+        # A file that was answered, even with nonsense, is not the stuck one.
+        mod = load_tool("scratch = /pscratch/sd/u/user\n")
+        listing = "AT\t1.json\nOK\t1.json\tnot json\nAT\t2.json\n"
+        err = io.StringIO()
+        with _patched(mod, "remote_out", lambda *a, **k: (124, listing)), \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(mod._read_queue(), [])
+        self.assertIn("stuck on: 2.json", err.getvalue())
+
+    def _read_local_queue(self, unreadable, readable):
+        """_read_queue's own script, run here over a queue whose *unreadable*
+        entries are FIFOs nobody writes: opening one blocks the way a read of
+        a file on a dead Lustre storage target does."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        queue = Path(tmp) / "queue"
+        queue.mkdir()
+        for name in readable:
+            (queue / ("%s.json" % name)).write_text(
+                '{"job": "%s",\n "src": "/p/%s", "dest": "/d/%s"}\n'
+                % (name, name, name))
+        for name in unreadable:
+            os.mkfifo(str(queue / ("%s.json" % name)))
+        mod = load_tool("scratch = /pscratch/sd/u/user\nreturn_queue = %s\n" % tmp)
+
+        def remote_out(argv, **kwargs):
+            # Its own session, so a listing that hangs can be killed whole:
+            # a reader left blocked on a FIFO would hold stdout open.
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                    universal_newlines=True,
+                                    start_new_session=True)
+            try:
+                out, _ = proc.communicate(timeout=20)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate()
+                self.fail("the queue listing hung on an unreadable file")
+            return proc.returncode, out
+
+        err = io.StringIO()
+        with _patched(mod, "remote_out", remote_out), \
+             mock.patch.dict(os.environ, {"NERSC_NO_PROGRESS_SECONDS": "2"}), \
+             contextlib.redirect_stderr(err):
+            entries = mod._read_queue()
+        return [e["job"] for e in entries], err.getvalue()
+
+    @unittest.skipUnless(shutil.which("bash") and shutil.which("timeout"),
+                         "needs bash and coreutils timeout")
+    def test_an_unreadable_queue_file_is_passed_over(self):
+        jobs, err = self._read_local_queue(["2"], ["1", "3"])
+        self.assertEqual(jobs, ["1", "3"])
+        self.assertIn("2.json: gave nothing for 1s", err)
+        self.assertNotIn("stopped early", err)
+
+    @unittest.skipUnless(shutil.which("bash") and shutil.which("timeout"),
+                         "needs bash and coreutils timeout")
+    def test_queue_listing_stops_when_storage_looks_down(self):
+        jobs, err = self._read_local_queue(["2", "3", "4"], ["1", "5"])
+        self.assertEqual(jobs, ["1"])
+        self.assertIn("stopped early (rc=75)", err)
+        self.assertIn("3 entries in a row gave nothing", err)
+
 
 class TestSocketDirectory(unittest.TestCase):
     """The control socket's directory must be ours alone.
@@ -903,6 +966,183 @@ class TestReap(unittest.TestCase):
         rc, out, _ = self.reap()
         self.assertEqual(rc, 0)
         self.assertIn("reap: 2 returned", out)
+
+    def test_a_job_whose_pull_failed_is_tried_after_the_others(self):
+        for job in ("201", "202", "203"):
+            self.track(job, self.SCRATCH + "/runs/" + job)
+            self.states[job] = "RUNNING"
+        self.states["201"] = "COMPLETED"
+        self.reap()
+        broken = {"201"}
+
+        def pull(record):
+            self.pull_ok = record["job"] not in broken
+        self.on_pull = pull
+        self.states["202"] = self.states["203"] = "COMPLETED"
+        rc, out, _ = self.reap()
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.pulled, ["201"])
+        self.pulled = []
+        rc, out, _ = self.reap()
+        self.assertEqual(self.pulled, ["202", "203", "201"])
+        self.assertIn("/hub/runs/201  [last pull failed]\n", out)
+        broken.clear()
+        self.pulled = []
+        rc, out, _ = self.reap()
+        self.assertEqual(self.pulled, ["201"])
+        failed = self.mod.STATE_DIR / "reap-failed.json"
+        self.assertEqual(json.loads(failed.read_text()), {})
+
+    def test_failure_marks_leave_with_their_entries(self):
+        self.track("204", self.SCRATCH + "/runs/a")
+        self.states["204"] = "COMPLETED"
+        self.pull_ok = False
+        self._two_passes()
+        failed = self.mod.STATE_DIR / "reap-failed.json"
+        self.assertEqual(sorted(json.loads(failed.read_text())), ["204.json"])
+        self.entries = []
+        self.track("205", self.SCRATCH + "/runs/b")
+        self.reap()
+        self.assertEqual(json.loads(failed.read_text()), {})
+
+    def track_unknown(self, job, days_ago):
+        self.clock.now = max(self.clock.now, 1790000000.0)   # October 2026
+        self.track(job, self.SCRATCH + "/runs/" + job)
+        if days_ago is not None:
+            self.entries[-1]["tracked_at"] = self.clock.now - days_ago * 86400
+
+    def test_reap_names_jobs_accounting_has_forgotten(self):
+        self.track_unknown("301", 30)
+        self.track_unknown("302", 1)      # may not have reached sacct yet
+        self.track_unknown("303", None)   # does not say when it was tracked
+        self.track_unknown("304", 30)
+        self.states["304"] = "PENDING"
+        rc, out, _ = self.reap()
+        self.assertIn("1 tracked job unknown to Slurm's accounting for over "
+                      "7 days; `nersc untrack --forgotten` sets it aside", out)
+        _, listed, _ = self.reap("--list")
+        self.assertIn("1 tracked job unknown", listed)
+
+    def untrack(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.mod.cmd_untrack(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_untrack_forgotten_moves_only_old_entries_accounting_lacks(self):
+        self.track_unknown("301", 30)
+        self.track_unknown("302", 1)
+        self.track_unknown("303", None)
+        self.track_unknown("304", 30)
+        self.states["304"] = "PENDING"
+        self.rm_result = (0, 1)
+        rc, out, _ = self.untrack("--forgotten")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.removed), 1)
+        argv = self.removed[0]
+        self.assertEqual(argv[:2], ["bash", "-c"])
+        self.assertEqual(argv[3:], ["untrack", self.QUEUE, "301.json"])
+        self.assertIn("untracking 301  %s/runs/301 -> /hub/runs/301  (tracked "
+                      % self.SCRATCH, out)
+        self.assertIn("2 more unknown to accounting were tracked in the last 7 "
+                      "days, or do not say when", out)
+        self.assertIn("untracked 1 of 1 entry into %s/untracked/" % self.QUEUE, out)
+        self.assertFalse((self.mod.STATE_DIR / "reap.lock.d").exists())
+
+    def test_untrack_by_name_and_dry_run(self):
+        self.track_unknown("401", None)
+        self.track_unknown("402", None)
+        rc, out, err = self.untrack("--dry-run", "401", "499")
+        self.assertEqual(rc, 1)
+        self.assertIn("would untrack 401", out)
+        self.assertIn("499 is not in the return queue", err)
+        self.assertEqual(self.removed, [])
+        self.rm_result = (0, 1)
+        rc, out, _ = self.untrack("402")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.removed[0][3:], ["untrack", self.QUEUE, "402.json"])
+
+    def test_untrack_refuses_bad_arguments_and_a_running_reap(self):
+        for args in ([], ["--forgotten", "401"], ["--all"]):
+            self.assertIn("untrack", refusal(self.mod.cmd_untrack, args))
+        self.mod.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        (self.mod.STATE_DIR / "reap.lock.d").mkdir()
+        self.assertIn("a reap pass is running",
+                      refusal(self.mod.cmd_untrack, ["401"]))
+        self.assertEqual(self.removed, [])
+
+    @unittest.skipUnless(
+        subprocess.run(["mv", "--version"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL).returncode == 0,
+        "needs GNU mv, as NERSC has")
+    def test_untrack_moves_files_aside_and_keeps_an_earlier_one(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        queue = Path(tmp) / "queue"
+        queue.mkdir()
+        (Path(tmp) / "untracked").mkdir()
+        (Path(tmp) / "untracked" / "-1.json").write_text("old\n")
+        for name in ("-1.json", "2 x.json", "3.json"):
+            (queue / name).write_text("new\n")
+
+        def remote_count(argv):
+            done = subprocess.run(argv, stdout=subprocess.PIPE,
+                                  universal_newlines=True, timeout=30)
+            return done.returncode, done.stdout.count("\n")
+
+        entries = [{"_file": name} for name in ("-1.json", "2 x.json")]
+        with _patched(self.mod, "remote_count", remote_count):
+            self.assertEqual(self.mod._move_aside(tmp, entries), 2)
+        self.assertEqual(sorted(p.name for p in queue.iterdir()), ["3.json"])
+        aside = Path(tmp) / "untracked"
+        self.assertEqual(sorted(p.name for p in aside.iterdir()),
+                         ["-1.json", "-1.json.~1~", "2 x.json"])
+        self.assertEqual((aside / "-1.json.~1~").read_text(), "old\n")
+
+
+class TestScratchStorageCheck(unittest.TestCase):
+    """`nersc doctor` naming a Lustre storage target that stopped answering."""
+
+    HEAD = ("UUID 1K-blocks Used Available Use% Mounted on\n"
+            "scratch-MDT0000_UUID 1 1 1 1% /pscratch[MDT:0]\n"
+            "scratch-OST003b_UUID 1 1 1 71% /pscratch[OST:59]\n")
+
+    def setUp(self):
+        self.mod = load_tool("scratch = /pscratch/sd/u/user\n")
+
+    def test_every_target_answering(self):
+        line, bad = self.mod.describe_lfs_df(
+            self.HEAD + "scratch-OST003c_UUID 1 1 1 69% /pscratch[OST:60]\n"
+            "\nfilesystem_summary: 1 1 1 70% /pscratch\n", 0)
+        self.assertEqual((line, bad), ("scratch storage: every target answered", 0))
+
+    def test_a_target_that_stopped_answering_is_named(self):
+        line, bad = self.mod.describe_lfs_df(
+            self.HEAD + "scratch-OST003c_UUID 1 1 1 69% /pscratch[OST:60]\n", 137)
+        self.assertEqual(bad, 1)
+        self.assertIn("OST 61 is NOT ANSWERING (lfs df stopped after OST 60", line)
+        line, bad = self.mod.describe_lfs_df("", 137)
+        self.assertIn("a storage target is NOT ANSWERING (lfs df stopped before "
+                      "printing any target", line)
+
+    def test_inactive_targets_are_listed_and_a_failed_check_is_not_a_problem(self):
+        line, bad = self.mod.describe_lfs_df(
+            self.HEAD + "scratch-OST000a_UUID : inactive device\n"
+            "filesystem_summary: 1 1 1 70% /pscratch\n", 0)
+        self.assertEqual((line, bad), (
+            "scratch storage: every target answered; inactive: OST 10", 0))
+        self.assertEqual(self.mod.describe_lfs_df("lfs: error\n", 2),
+                         ("scratch storage: not checked (lfs df rc=2)", 0))
+
+    def test_the_check_reads_its_own_exit_code(self):
+        said = self.HEAD + "LFSDF_RC\t137\n"
+        with _patched(self.mod, "remote_out", lambda argv, **kw: (0, said)):
+            line, bad = self.mod.check_scratch_storage()
+        self.assertEqual(bad, 1)
+        self.assertIn("OST 60 is NOT ANSWERING", line)
+        with _patched(self.mod, "remote_out", lambda argv, **kw: (3, "")):
+            self.assertEqual(self.mod.check_scratch_storage(),
+                             ("scratch storage: not checked (NERSC has no lfs)", 0))
 
 
 class TestStoppingAndWaiting(unittest.TestCase):

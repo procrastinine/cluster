@@ -127,7 +127,7 @@ A FASRC login node running the NERSC companion; see
 
 | Path | What it holds |
 |---|---|
-| `$PSCRATCH/.nersc-return/queue/<jobid>.json`, `done/` | the companion's return registry: runs waiting to come back, and those that have (`return_queue` moves it) |
+| `$PSCRATCH/.nersc-return/queue/<jobid>.json`, `done/`, `untracked/` | the companion's return registry: runs waiting to come back, those that have, and entries set aside by `nersc untrack` (`return_queue` moves it) |
 | `~/<mirror_dest>` | the companion's code mirror |
 | `~/.cluster/` | the same session records as on any cluster |
 
