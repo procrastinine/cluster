@@ -30,12 +30,14 @@ Verbs:
                       the named jobs, or every job tracked over 7 days ago
                       that Slurm's accounting does not know (reap never
                       could act on those); moving one back tracks it again
-  reap [--list] [--max-seconds=N]
+  reap [--list] [--max-seconds=N] [--parallel=N]
                       one idempotent pass: pull finished tracked run dirs back
                       here atomically (run it periodically, e.g. from cron);
-                      with N, no new pull starts after N seconds (0: no
-                      limit, the default); SIGTERM ends a pass cleanly;
-                      jobs whose pull failed last time are tried last
+                      with --max-seconds, no new pull starts after N seconds
+                      (0: no limit, the default); with --parallel, up to N
+                      pulls run at once (1, the default, is one at a time);
+                      SIGTERM ends a pass cleanly; jobs whose pull failed
+                      last time are tried last
   q / jobs            compact `squeue --me` snapshot
   peek JOBID [FILE] [-n N]   inspect a job from here: state + run-dir listing +
                       tail of its output (or FILE) — no paths needed
@@ -58,6 +60,7 @@ Verbs:
   connect/disconnect  explicit master control (normally automatic)
 """
 
+import concurrent.futures
 import errno
 import fcntl
 import json
@@ -71,12 +74,13 @@ import signal
 import socket as socketlib
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from stat import S_ISDIR as stat_is_dir, S_ISLNK as stat_is_link
 
-VERSION = "2.3"
+VERSION = "2.4"
 
 # Editing the installed copy in place is safe: `cluster bridge push` compares
 # it with what it last installed before shipping anything, and never overwrites
@@ -828,17 +832,67 @@ def _run_child(argv):
     under --partial and removes its temporary one otherwise; a SIGKILL would
     leave that temporary file behind in the destination. Only a child that
     does not stop in that time is killed.
+
+    A signal reaches only the main thread, so a child waited on in another
+    (a reap pass's parallel pulls) is stopped by _stop_children instead, and
+    its wait then raises CutShort rather than report a failed rsync.  One
+    that would start after that raises it at once.
     """
-    proc = subprocess.Popen(argv)
+    with _CHILDREN_LOCK:
+        if _STOPPING.is_set():
+            raise CutShort()
+        proc = subprocess.Popen(argv)
+        _CHILDREN.add(proc)
     try:
         while True:
             try:
-                return proc.wait(timeout=PROGRESS_TICK_SECONDS)
+                code = proc.wait(timeout=PROGRESS_TICK_SECONDS)
+                break
             except subprocess.TimeoutExpired:
                 _tick()
     except BaseException:
         _stop_child(proc)
         raise
+    finally:
+        with _CHILDREN_LOCK:
+            _CHILDREN.discard(proc)
+    if _STOPPING.is_set():
+        raise CutShort()
+    return code
+
+
+#: _run_child's children still running, and whether _stop_children has
+#: stopped them; see _run_child.
+_CHILDREN = set()
+_CHILDREN_LOCK = threading.Lock()
+_STOPPING = threading.Event()
+
+
+class CutShort(BaseException):
+    """A child _stop_children stopped: the pass is ending, nothing failed."""
+
+
+def _stop_children(grace=10):
+    """Stop every child _run_child is waiting on, in any thread: SIGTERM to
+    all, then SIGKILL to any still running *grace* seconds later.  None
+    starts after this."""
+    with _CHILDREN_LOCK:
+        _STOPPING.set()
+        procs = list(_CHILDREN)
+    for proc in procs:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    for proc in procs:
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
 
 def _stop_child(proc, grace=10):
@@ -2573,9 +2627,11 @@ def _return_filter_args(record):
     return args
 
 
-def _pull_run_dir(record, state):
+def _pull_run_dir(record, state, labelled=False):
     """Pull one registered run directory home; *state* is the job's Slurm
-    state, for the report.  False, with the reason on stderr, on failure."""
+    state, for the report.  False, with the reason on stderr, on failure.
+    *labelled* starts each file's line with the job, for pulls that share
+    one output."""
     src = record["src"]
     dest = os.path.expanduser(record["dest"])
     remote_shell = " ".join(shlex.quote(p) for p in base_ssh())
@@ -2585,8 +2641,11 @@ def _pull_run_dir(record, state):
     fresh = not os.path.isdir(dest)
     target = dest + ".nersc-part" if fresh else dest
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    out_format = "%n"
+    if labelled:
+        out_format = "%s: %%n" % record["job"].replace("%", "%%")
     command = ["rsync", "-a", "--partial", rsync_stall_flag(),
-               "--out-format=%n", "-e", remote_shell]
+               "--out-format=" + out_format, "-e", remote_shell]
     try:
         command.extend(_return_filter_args(record))
     except ValueError as error:
@@ -2695,39 +2754,124 @@ def _touch_lock(lock):
         pass
 
 
-REAP_USAGE = "usage: nersc reap [--list] [--max-seconds=N]"
+REAP_USAGE = "usage: nersc reap [--list] [--max-seconds=N] [--parallel=N]"
+
+#: The most pulls one pass runs at once.  Each is an rsync over its own ssh
+#: connection to a DTN, so this many connections at most.
+REAP_PARALLEL_MAX = 16
 
 
 def _reap_options(args):
-    """(list_only, budget) from reap's arguments; anything else is refused.
+    """(list_only, budget, parallel) from reap's arguments; anything else is
+    refused.
 
     The budget, in seconds, is when a pass stops starting pulls; 0 (the
     default) is none.  It never cuts a pull short.  A caller with a hard
     limit need not set one: the SIGTERM that ends the pass unwinds it, which
-    stops the pull in progress (rsync keeps its partial files) and saves
+    stops the pulls in progress (rsync keeps its partial files) and saves
     the pass's state, so the next pass resumes.  It is for a caller that
     kills without warning, or wants each pass to end between pulls.
+
+    *parallel* is how many pulls run at once.  A pull is one rsync over one
+    ssh connection, and a long route can cap what one connection carries:
+    on 9 October 2026 a DTN sent FASRC 0.7 MB/s over one connection,
+    2.7 MB/s over four and 5.3 MB/s over eight.
     """
-    list_only, budget = False, 0
+    list_only, budget, parallel = False, 0, 1
     args = list(args)
     while args:
         arg = args.pop(0)
+        name, has_value, value = arg.partition("=")
         if arg == "--list":
             list_only = True
-        elif arg.startswith("--max-seconds="):
-            budget = _whole_number(arg.split("=", 1)[1], "--max-seconds")
-        elif arg == "--max-seconds":
-            if not args:
-                die("--max-seconds needs a number of seconds", REAP_USAGE)
-            budget = _whole_number(args.pop(0), "--max-seconds")
+        elif name in ("--max-seconds", "--parallel"):
+            if not has_value:
+                if not args:
+                    die("%s needs a number" % name, REAP_USAGE)
+                value = args.pop(0)
+            if name == "--max-seconds":
+                budget = _whole_number(value, name)
+            else:
+                parallel = _whole_number(value, name)
+                if not 1 <= parallel <= REAP_PARALLEL_MAX:
+                    die("--parallel takes 1 to %d pulls at once, not %d"
+                        % (REAP_PARALLEL_MAX, parallel), REAP_USAGE)
         else:
             die("reap does not take %r" % arg, REAP_USAGE)
-    return list_only, budget
+    return list_only, budget, parallel
+
+
+def _local_dest(entry):
+    """Where *entry* returns to, as one spelling of the path."""
+    return os.path.normpath(os.path.expanduser(entry["dest"]))
+
+
+class _Pulls(object):
+    """Up to *parallel* pulls of a reap pass at once.
+
+    Each pull runs _pull_run_dir in a thread of its own, since its time goes
+    on waiting for rsync; everything else in the pass (the queue, accounting,
+    retiring an entry and cleaning scratch) stays in the calling thread, one
+    entry at a time.  With *parallel* 1 there is no thread at all: a pull
+    runs in the caller, exactly as before there was a choice.
+    """
+
+    def __init__(self, parallel):
+        self.parallel = parallel
+        self.running = {}  # future -> (entry, state)
+        self.pool = None
+        if parallel > 1:
+            _STOPPING.clear()
+            self.pool = concurrent.futures.ThreadPoolExecutor(parallel)
+
+    def make_room(self, entry):
+        """Wait until a pull of *entry* could start: a slot is free, and no
+        running pull writes its destination, since two rsyncs must never
+        write one directory.  [(entry, state, pulled)] for each pull that
+        finished meanwhile."""
+        finished, dest = [], _local_dest(entry)
+        while (len(self.running) >= self.parallel or any(
+                _local_dest(other) == dest for other, _ in self.running.values())):
+            finished.extend(self._wait())
+        return finished
+
+    def start(self, entry, state):
+        """Start pulling *entry*, after make_room; [(entry, state, pulled)]
+        when the pull ran here and so has already finished."""
+        sys.stdout.flush()  # what the pass printed goes before rsync's lines
+        if self.pool is None:
+            return [(entry, state, _pull_run_dir(entry, state))]
+        future = self.pool.submit(_pull_run_dir, entry, state, True)
+        self.running[future] = (entry, state)
+        return []
+
+    def drain(self):
+        """[(entry, state, pulled)] for each pull still running, as it finishes."""
+        while self.running:
+            for done in self._wait():
+                yield done
+
+    def _wait(self):
+        sys.stdout.flush()
+        done, _ = concurrent.futures.wait(
+            list(self.running), timeout=PROGRESS_TICK_SECONDS,
+            return_when=concurrent.futures.FIRST_COMPLETED)
+        _tick()
+        return [self.running.pop(future) + (future.result(),) for future in done]
+
+    def close(self):
+        """Stop whatever is still running (only a pass that is being stopped
+        leaves any), and let the threads go."""
+        if self.pool is None:
+            return
+        if self.running:
+            _stop_children()
+        self.pool.shutdown(wait=True)
 
 
 def cmd_reap(args):
     global ON_TICK
-    list_only, budget = _reap_options(args)
+    list_only, budget, parallel = _reap_options(args)
     entries = _read_queue()
     if not entries:
         print("nothing tracked")
@@ -2763,30 +2907,15 @@ def cmd_reap(args):
                            for e in entries if _queue_key(e) in failed_before)
         rq = return_queue_dir()
         ON_TICK = lambda: _touch_lock(lock)  # noqa: E731
-        for entry in entries:
-            _touch_lock(lock)
-            job, state = entry["job"], states.get(entry["job"], "UNKNOWN")
-            # A job may own several independently returned roots.  Queue-file
-            # identity, not the shared Slurm id, is the debounce identity.
-            seen_key = _queue_key(entry)
-            if not is_terminal(state):
-                seen.pop(seen_key, None)
-                waiting.append("%s (%s)" % (job, state))
-                continue
-            first_terminal = seen.setdefault(seen_key, now)
-            if now - first_terminal < 1:
-                # First sighting: wait one pass before acting, so a job that
-                # requeues itself on timeout (TIMEOUT -> PENDING) is not
-                # pulled — and above all not cleaned — mid-resurrection.
-                print("%s newly terminal (%s); acting next pass" % (job, state))
-                continue
-            if budget and time.time() - started > budget:
-                print("time budget spent; remaining jobs next pass")
-                break
-            if not _pull_run_dir(entry, state):
+
+        def settle(entry, state, pulled):
+            """Record one entry's pull and, when it worked, retire the entry
+            (and clean its run dir off scratch, if asked)."""
+            job, seen_key = entry["job"], _queue_key(entry)
+            if not pulled:
                 failed.append(job)
                 pull_failed[seen_key] = int(time.time())
-                continue
+                return
             pull_failed.pop(seen_key, None)
             # What to delete once the entry is retired, if anything.  The
             # path is checked again here, at use time, because a queue entry
@@ -2807,7 +2936,7 @@ def cmd_reap(args):
                             "scratch; the entry stays queued for the next pass\n"
                             % job)
                         failed.append(job)
-                        continue
+                        return
                     if not is_terminal(recheck[job]):
                         # Requeued since the pass began: what was pulled is
                         # a mid-run snapshot.  Keep the entry, and start its
@@ -2815,7 +2944,7 @@ def cmd_reap(args):
                         # (and only then cleaned) once it really finishes.
                         seen.pop(seen_key, None)
                         waiting.append("%s (%s)" % (job, recheck[job]))
-                        continue
+                        return
                     remove = os.path.normpath(entry["src"])
             # Retire first, delete second: a failed move keeps the source,
             # so the next pass can redo the whole return, and a deleted
@@ -2823,7 +2952,7 @@ def cmd_reap(args):
             # pull on every later pass.
             if not _retire(rq, entry):
                 failed.append(job)
-                continue
+                return
             seen.pop(seen_key, None)
             cleaned = ""
             if remove:
@@ -2833,6 +2962,39 @@ def cmd_reap(args):
                     unclean.append(job)
             returned.append(job)
             print("returned %s (%s) -> %s%s" % (job, state, entry["dest"], cleaned))
+
+        pulls = _Pulls(parallel)
+        try:
+            for entry in entries:
+                _touch_lock(lock)
+                job, state = entry["job"], states.get(entry["job"], "UNKNOWN")
+                # A job may own several independently returned roots.  Queue-
+                # file identity, not the shared Slurm id, is the debounce
+                # identity.
+                seen_key = _queue_key(entry)
+                if not is_terminal(state):
+                    seen.pop(seen_key, None)
+                    waiting.append("%s (%s)" % (job, state))
+                    continue
+                first_terminal = seen.setdefault(seen_key, now)
+                if now - first_terminal < 1:
+                    # First sighting: wait one pass before acting, so a job
+                    # that requeues itself on timeout (TIMEOUT -> PENDING) is
+                    # not pulled — and above all not cleaned — mid-
+                    # resurrection.
+                    print("%s newly terminal (%s); acting next pass" % (job, state))
+                    continue
+                for done in pulls.make_room(entry):
+                    settle(*done)
+                if budget and time.time() - started > budget:
+                    print("time budget spent; remaining jobs next pass")
+                    break
+                for done in pulls.start(entry, state):
+                    settle(*done)
+            for done in pulls.drain():
+                settle(*done)
+        finally:
+            pulls.close()
     except (KeyboardInterrupt, Terminated) as stop:
         # Stopped part way: what was done is recorded below and the verdict
         # still printed, and only then does the stop carry on outwards.

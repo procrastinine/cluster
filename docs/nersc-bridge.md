@@ -344,10 +344,11 @@ from cron or from a long-running watcher job:
 nersc reap --list     # what is tracked and each job's state
 nersc reap            # return every job that has finished
 nersc reap --max-seconds=540   # start no pull after 9 minutes
+nersc reap --parallel=8        # up to 8 pulls at once
 ```
 
 A pass has no time budget: it returns every finished job, however long the
-pulls take. A SIGTERM, such as a scheduler's time limit, ends it cleanly. The
+pulls take. A SIGTERM, such as a scheduler's time limit, ends it cleanly. Each
 pull in progress is asked to stop and resumes on the next pass, the pass
 saves its record of which jobs it has seen finish and lets go of its lock,
 and it prints its verdict
@@ -360,6 +361,20 @@ scheduler that kills with SIGKILL and no warning, or for passes that should
 end between pulls: set it below the scheduler's limit, as in the example
 above. The jobs it leaves wait for the next pass. `reap` refuses any other
 argument.
+
+`--parallel=N` (or `--parallel N`, 1 to 16) runs up to N pulls at once; the
+default, 1, runs one at a time. Each pull is one rsync over its own ssh
+connection to a DTN, and a long route can cap what one connection carries
+well below what the route can. On 9 October 2026 a DTN sent FASRC 0.7 MB/s
+over one connection, 2.7 MB/s over four and 5.3 MB/s over eight, so a
+backlog of finished jobs drained at the speed of one. With N above 1, each
+rsync line starts with its job (`59452518: measurement/tee48.json`), and two
+entries with one destination are never pulled at the same time. A pull that
+stalls on a dead storage target then holds one of the N slots instead of the
+whole pass. Everything else still happens one entry at a time: retiring an
+entry, cleaning its run dir off scratch, and the budget, which is checked
+whenever a slot frees. A SIGTERM stops every pull in progress, and none of
+them is reported as failed.
 
 Only one pass runs at a time; a second one says `another reap is running;
 skipping`. A live pass touches its lock every 15 seconds, even inside one long

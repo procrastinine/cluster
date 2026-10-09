@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -269,6 +270,18 @@ class TestNerscTool(unittest.TestCase):
             mod.cmd_submit(["--no-sync", "jobs/s.py", "--L", "6"])
             self.assertEqual(calls[-1],
                              ([".venv/bin/python", "jobs/s.py", "--L", "6"], "proj"))
+
+    def test_a_labelled_pull_names_its_job_on_every_line(self):
+        mod, commands = self.mod, []
+        with tempfile.TemporaryDirectory() as tmp:
+            record = {"job": "57615813_6", "src": "/pscratch/sd/u/user/runs/a",
+                      "dest": tmp, "cleanup": False}
+            with _patched(mod, "pick_dtn", lambda: "dtn-fake"), \
+                    _patched(mod, "_run_child", lambda argv: commands.append(argv) or 0):
+                self.assertTrue(mod._pull_run_dir(record, "COMPLETED"))
+                self.assertTrue(mod._pull_run_dir(record, "COMPLETED", labelled=True))
+        self.assertIn("--out-format=%n", commands[0])
+        self.assertIn("--out-format=57615813_6: %n", commands[1])
 
     def test_pull_run_dir_concurrent_first_arrival_is_not_a_success(self):
         # A manual fetch and the reaper can both attempt the FIRST arrival of
@@ -727,6 +740,7 @@ class TestReap(unittest.TestCase):
         self.mv_rc = 0
         self.rm_result = (0, 3)
         self.pulled, self.moved, self.removed = [], [], []
+        self.labelled = []
         self.on_pull = None
         mod = self.mod
         for name, value in (
@@ -744,8 +758,9 @@ class TestReap(unittest.TestCase):
             return {job: self.rechecks[job] for job in jobs if job in self.rechecks}
         return {job: self.states[job] for job in jobs if job in self.states}
 
-    def _pull(self, record, state):
+    def _pull(self, record, state, labelled=False):
         self.pulled.append(record["job"])
+        self.labelled.append(labelled)
         if self.on_pull:
             self.on_pull(record)
         return self.pull_ok
@@ -999,6 +1014,132 @@ class TestReap(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("reap: 2 returned", out)
 
+    def test_parallel_pulls_run_together_and_no_more_than_asked(self):
+        self._ready("130", "131", "132", "133", "134")
+        together = threading.Barrier(3, timeout=10)
+        guard, running, most = threading.Lock(), [0], [0]
+
+        def pull(record):
+            with guard:
+                running[0] += 1
+                most[0] = max(most[0], running[0])
+            if record["job"] in ("130", "131", "132"):
+                together.wait()   # breaks unless three pulls run at once
+            time.sleep(0.05)
+            with guard:
+                running[0] -= 1
+        self.on_pull = pull
+        rc, out, _ = self.reap("--parallel=3")
+        self.assertEqual(rc, 0)
+        self.assertEqual(most[0], 3)
+        self.assertEqual(sorted(self.pulled), ["130", "131", "132", "133", "134"])
+        self.assertEqual(self.labelled, [True] * 5)
+        self.assertIn("reap: 5 returned, 0 failed", out)
+        self.assertEqual(len(self.moved), 5)
+
+    def test_parallel_pulls_never_write_one_destination_at_once(self):
+        self._ready("135", "136", "137")
+        self.entries[1]["dest"] = self.entries[0]["dest"]
+        guard, writing, clashes = threading.Lock(), set(), []
+
+        def pull(record):
+            with guard:
+                if record["dest"] in writing:
+                    clashes.append(record["job"])
+                writing.add(record["dest"])
+            time.sleep(0.1)
+            with guard:
+                writing.discard(record["dest"])
+        self.on_pull = pull
+        rc, out, _ = self.reap("--parallel=3")
+        self.assertEqual((rc, clashes), (0, []))
+        self.assertIn("reap: 3 returned", out)
+
+    def test_a_parallel_pass_starts_no_pull_once_its_budget_is_spent(self):
+        self._ready("138", "139", "140", "141")
+        both = threading.Barrier(2, timeout=10)
+
+        def slow(record):
+            both.wait()   # 139 starts before 138 spends the budget
+            self.clock.now += 100
+        self.on_pull = slow
+        rc, out, _ = self.reap("--parallel=2", "--max-seconds=50")
+        self.assertEqual(sorted(self.pulled), ["138", "139"])
+        self.assertIn("time budget spent; remaining jobs next pass", out)
+        self.assertIn("reap: 2 returned", out)
+
+    def test_a_failed_parallel_pull_is_marked_like_any_other(self):
+        self._ready("142", "143")
+        self.on_pull = None
+        self.pull_ok = False
+        rc, out, _ = self.reap("--parallel=2")
+        self.assertEqual(rc, 1)
+        self.assertIn("0 returned, 2 failed", out)
+        marks = json.loads((self.mod.STATE_DIR / "reap-failed.json").read_text())
+        self.assertEqual(sorted(marks), ["142.json", "143.json"])
+
+    def test_a_stopped_parallel_pass_stops_every_pull_and_blames_none(self):
+        """The signal reaches only the pass's own thread; each pull's rsync
+        is still asked to stop, and none is reported as failed."""
+        self._ready("144", "145", "146")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        said = {job: Path(tmp.name) / job for job in ("144", "145", "146")}
+        child = ("import signal, sys, time\n"
+                 "def stop(*_):\n"
+                 "    open(sys.argv[1], 'w').write('asked to stop')\n"
+                 "    raise SystemExit(20)\n"
+                 "signal.signal(signal.SIGTERM, stop)\n"
+                 "open(sys.argv[1], 'w').write('ready')\n"
+                 "time.sleep(30)\n")
+        results = []
+
+        def pull(record):
+            code = self.mod._run_child([sys.executable, "-c", child,
+                                        str(said[record["job"]])])
+            results.append(code)   # never reached: the wait is cut short
+            if code:
+                raise AssertionError("a stopped pull was reported as failed")
+        self.on_pull = pull
+        tick = self.mod._tick
+
+        def stop_when_both_run():
+            tick()
+            if (threading.current_thread() is threading.main_thread() and all(
+                    said[job].exists() for job in ("144", "145"))):
+                raise self.mod.Terminated(signal.SIGTERM)
+        out, err = io.StringIO(), io.StringIO()
+        with _patched(self.mod, "PROGRESS_TICK_SECONDS", 0.1), \
+                _patched(self.mod, "_tick", stop_when_both_run), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                self.assertRaises(self.mod.Terminated):
+            self.mod.cmd_reap(["--parallel=2"])
+        self.assertEqual(said["144"].read_text(), "asked to stop")
+        self.assertEqual(said["145"].read_text(), "asked to stop")
+        self.assertFalse(said["146"].exists(), "no pull starts once stopping")
+        self.assertEqual(results, [])
+        self.assertIn("reap: 0 returned, 0 failed", out.getvalue())
+        self.assertIn("stopped by SIGTERM part way through", out.getvalue())
+        self.assertNotIn("FAILED", err.getvalue())
+        self.assertFalse((self.mod.STATE_DIR / "reap-failed.json").exists()
+                         and json.loads((self.mod.STATE_DIR / "reap-failed.json")
+                                        .read_text()))
+        self.assertFalse((self.mod.STATE_DIR / "reap.lock.d").exists())
+
+    def test_parallel_takes_a_count_within_reason(self):
+        self.track("147", self.SCRATCH + "/runs/147")
+        self.states["147"] = "COMPLETED"
+        for args, said in (
+                (["--parallel=0"], "--parallel takes 1 to 16 pulls at once, not 0"),
+                (["--parallel", "17"], "not 17"),
+                (["--parallel=two"], "--parallel needs a whole number"),
+                (["--parallel"], "usage: nersc reap [--list] [--max-seconds=N] "
+                                 "[--parallel=N]")):
+            self.assertIn(said, refusal(self.mod.cmd_reap, args), args)
+        self.assertEqual(self.mod._reap_options(["--parallel", "4", "--max-seconds=9"]),
+                         (False, 9, 4))
+        self.assertEqual(self.pulled, [])
+
     def test_a_job_whose_pull_failed_is_tried_after_the_others(self):
         for job in ("201", "202", "203"):
             self.track(job, self.SCRATCH + "/runs/" + job)
@@ -1244,6 +1385,12 @@ class TestStoppingAndWaiting(unittest.TestCase):
     def test_a_captured_stall_does_not_warn_about_the_remote_side(self):
         self.mod._stall_report("squeue --me", 200, capture=True)
         self.assertNotIn("may still be running", self.err.getvalue())
+
+    def test_no_child_starts_once_children_are_stopped(self):
+        self.mod._stop_children()
+        with self.assertRaises(self.mod.CutShort):
+            self.mod._run_child(self.python("raise SystemExit(0)"))
+        self.assertEqual(self.mod._CHILDREN, set())
 
     def test_a_terminating_signal_stops_the_whole_step(self):
         # The step is held here: dropped, a Popen reaps its child itself, and
