@@ -314,6 +314,12 @@ read. When three records in a row run out of time, the read stops,
 because the fault is then likely to affect most of scratch rather than
 a few files. With `no_progress_seconds = 0`, reads have no limit.
 
+The limit is a wait, not a kill. A process waiting on a storage target
+that has stopped answering cannot be killed, not even with SIGKILL: on
+login33 on 9 October 2026, a `find` killed after 16 hours stayed where
+it was. So the reader of a skipped record is left on the login node, and
+it ends by itself once the target answers.
+
 When one of scratch's Lustre object storage targets (OSTs) stops
 answering, a stat or read of any file stored on it hangs. That happened
 to pscratch OST 61 on 8 October 2026. Before this limit existed, one

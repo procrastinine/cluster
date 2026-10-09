@@ -76,7 +76,7 @@ from datetime import datetime
 from pathlib import Path
 from stat import S_ISDIR as stat_is_dir, S_ISLNK as stat_is_link
 
-VERSION = "2.2"
+VERSION = "2.3"
 
 # Editing the installed copy in place is safe: `cluster bridge push` compares
 # it with what it last installed before shipping anything, and never overwrites
@@ -2119,29 +2119,36 @@ def _read_queue():
     # the stat itself.  (pscratch OST 61, 8 October 2026: a `[ -e "$f" ]`
     # ahead of the announcement hung every pass "between files".)
     #
-    # Each read is bounded and then killed, so such a file is reported (SKIP)
-    # and passed over instead of ending the listing for every file after it,
-    # which in name order were the newest jobs.  A kill that cannot land
-    # leaves the progress guard to end the listing, as before.  Reads are
-    # unbounded only when abandonment is off (no_progress_seconds = 0) or
-    # NERSC has no `timeout`.
+    # Each file is read by a process of its own, which the listing waits for
+    # with a time limit (`read -t`) and never kills.  A process waiting on a
+    # target that has stopped answering cannot be killed: it sits in
+    # cl_sync_io_wait, uninterruptible, and outlives even SIGKILL until the
+    # target answers (login33, 9 October 2026: a `find` killed after 16
+    # hours stayed, and so did eight old listings parked on `[ -e "$f" ]`).
+    # So a file still unread when the limit runs out is reported (SKIP) and
+    # passed over, its reader left to end by itself, and the files after it
+    # are still read: in name order, the newest jobs.  The reader holds
+    # none of the connection's descriptors, so the connection closes
+    # without it.  Reads wait without a limit only when abandonment is off
+    # (no_progress_seconds = 0).
     limit = no_progress_seconds()
     bound = max(1, int(min(QUEUE_FILE_SECONDS, limit / 2))) if limit else 0
+    wait = "-t %d " % bound if bound else ""
     code, out = remote_out(
         ["bash", "-c",
-         'set -o pipefail; shopt -s nullglob; '
-         'cd %s/queue 2>/dev/null || exit 0; '
-         'read_file="cat --"; '
-         'if [ %d -gt 0 ] && command -v timeout >/dev/null 2>&1; then '
-         'read_file="timeout -s KILL %d cat --"; fi; '
-         'misses=0; '
+         'shopt -s nullglob; cd %s/queue 2>/dev/null || exit 0; misses=0; '
          'for f in *.json; do printf "AT\\t%%s\\n" "$f"; '
-         'if body=$($read_file "$f" 2>/dev/null | tr -d "\\n"); then '
-         'misses=0; printf "OK\\t%%s\\t%%s\\n" "$f" "$body"; '
-         'else rc=$?; printf "SKIP\\t%%s\\t%%d\\n" "$f" "$rc"; '
-         'case $rc in 124|137) misses=$((misses + 1));; esac; '
-         '[ "$misses" -lt %d ] || exit %d; fi; done'
-         % (shlex.quote(rq), bound, bound, QUEUE_MISSES_IN_A_ROW,
+         'exec 3< <(exec </dev/null 2>/dev/null; cat -- "$f" | tr -d "\\n"; '
+         'printf "\\n%%s\\n" "${PIPESTATUS[0]}"); '
+         'if IFS= read -r %s-u 3 body && read -r %s-u 3 rc; then '
+         'if [ "$rc" = 0 ]; then misses=0; '
+         'printf "OK\\t%%s\\t%%s\\n" "$f" "$body"; '
+         'else printf "SKIP\\t%%s\\t%%s\\n" "$f" "$rc"; fi; '
+         'elif [ $? -gt 128 ]; then printf "SKIP\\t%%s\\ttimeout\\n" "$f"; '
+         'misses=$((misses + 1)); [ "$misses" -lt %d ] || exit %d; '
+         'else printf "SKIP\\t%%s\\tno answer\\n" "$f"; fi; '
+         'exec 3<&-; done'
+         % (shlex.quote(rq), wait, wait, QUEUE_MISSES_IN_A_ROW,
             QUEUE_STORAGE_DOWN_RC)])
     entries = []
     announced = []
@@ -2186,8 +2193,9 @@ def _read_queue():
             sys.stderr.write(
                 "  %s: %s\n"
                 % (fname, "gave nothing for %ds; the storage holding it is "
-                          "not answering" % bound if rc in ("124", "137")
-                   else "could not be read (rc=%s)" % rc))
+                          "not answering" % bound if rc == "timeout"
+                   else "could not be read (%s)" % (
+                       rc if rc == "no answer" else "rc=%s" % rc)))
         sys.stderr.flush()
     if code != 0:
         # Never silent, and never fatal: the listing is its own progress

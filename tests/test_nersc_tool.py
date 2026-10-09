@@ -535,26 +535,50 @@ class TestNerscTool(unittest.TestCase):
             self.assertEqual(mod._read_queue(), [])
         self.assertIn("stuck on: 2.json", err.getvalue())
 
-    def _read_local_queue(self, unreadable, readable):
-        """_read_queue's own script, run here over a queue whose *unreadable*
-        entries are FIFOs nobody writes: opening one blocks the way a read of
-        a file on a dead Lustre storage target does."""
+    def _read_local_queue(self, readable, fifos=(), unkillable=()):
+        """_read_queue's own script, run here over a queue whose *fifos* are
+        FIFOs nobody writes, which block a reader the way a read of a file on
+        a dead Lustre storage target does, and whose *unkillable* entries are
+        read by a stand-in `cat` that no kill of its own stops."""
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp)
         queue = Path(tmp) / "queue"
         queue.mkdir()
-        for name in readable:
+        for name in list(readable) + list(unkillable):
             (queue / ("%s.json" % name)).write_text(
                 '{"job": "%s",\n "src": "/p/%s", "dest": "/d/%s"}\n'
                 % (name, name, name))
-        for name in unreadable:
+        for name in fifos:
             os.mkfifo(str(queue / ("%s.json" % name)))
+        env = dict(os.environ)
+        if unkillable:
+            # A read in uninterruptible I/O outlives SIGKILL and goes on
+            # holding its output open; a process in a session of its own,
+            # which outlives killing the reader, stands in for it.
+            bindir, pids = Path(tmp) / "bin", Path(tmp) / "pids"
+            bindir.mkdir()
+            stub = bindir / "cat"
+            stub.write_text(
+                "#!/bin/sh\n"
+                "case \"$2\" in\n"
+                "  %s) setsid sleep 30 & echo $! >> %s; wait ;;\n"
+                "  *) exec %s \"$@\" ;;\n"
+                "esac\n" % ("|".join("%s.json" % n for n in unkillable),
+                            shlex.quote(str(pids)), shutil.which("cat")))
+            stub.chmod(0o755)
+            env["PATH"] = "%s%s%s" % (bindir, os.pathsep, env["PATH"])
+
+            def stop_stand_ins():
+                for pid in pids.read_text().split() if pids.exists() else ():
+                    with contextlib.suppress(OSError):
+                        os.kill(int(pid), signal.SIGKILL)
+            self.addCleanup(stop_stand_ins)
         mod = load_tool("scratch = /pscratch/sd/u/user\nreturn_queue = %s\n" % tmp)
 
         def remote_out(argv, **kwargs):
-            # Its own session, so a listing that hangs can be killed whole:
-            # a reader left blocked on a FIFO would hold stdout open.
-            proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+            # Its own session, so that what it leaves behind, as it does on
+            # NERSC (readers still waiting), can be stopped afterwards.
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, env=env,
                                     universal_newlines=True,
                                     start_new_session=True)
             try:
@@ -563,6 +587,9 @@ class TestNerscTool(unittest.TestCase):
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.communicate()
                 self.fail("the queue listing hung on an unreadable file")
+            finally:
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
             return proc.returncode, out
 
         err = io.StringIO()
@@ -572,18 +599,23 @@ class TestNerscTool(unittest.TestCase):
             entries = mod._read_queue()
         return [e["job"] for e in entries], err.getvalue()
 
-    @unittest.skipUnless(shutil.which("bash") and shutil.which("timeout"),
-                         "needs bash and coreutils timeout")
+    @unittest.skipUnless(shutil.which("bash"), "needs bash")
     def test_an_unreadable_queue_file_is_passed_over(self):
-        jobs, err = self._read_local_queue(["2"], ["1", "3"])
+        jobs, err = self._read_local_queue(["1", "3"], fifos=["2"])
         self.assertEqual(jobs, ["1", "3"])
         self.assertIn("2.json: gave nothing for 1s", err)
         self.assertNotIn("stopped early", err)
 
-    @unittest.skipUnless(shutil.which("bash") and shutil.which("timeout"),
-                         "needs bash and coreutils timeout")
+    @unittest.skipUnless(shutil.which("bash") and shutil.which("setsid"),
+                         "needs bash and setsid")
+    def test_a_reader_no_kill_can_stop_is_passed_over_too(self):
+        jobs, err = self._read_local_queue(["1", "3"], unkillable=["2"])
+        self.assertEqual(jobs, ["1", "3"])
+        self.assertIn("2.json: gave nothing for 1s", err)
+
+    @unittest.skipUnless(shutil.which("bash"), "needs bash")
     def test_queue_listing_stops_when_storage_looks_down(self):
-        jobs, err = self._read_local_queue(["2", "3", "4"], ["1", "5"])
+        jobs, err = self._read_local_queue(["1", "5"], fifos=["2", "3", "4"])
         self.assertEqual(jobs, ["1"])
         self.assertIn("stopped early (rc=75)", err)
         self.assertIn("3 entries in a row gave nothing", err)
